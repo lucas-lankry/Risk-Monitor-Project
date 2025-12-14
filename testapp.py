@@ -1,11 +1,28 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, date
 import json
 import os
 import math
+import smtplib
+import socket
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import io
+
+# Import SendGrid
+try:
+    from sendgrid import SendGridAPIClient
+    from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
+    import base64
+    SENDGRID_AVAILABLE = True
+except ImportError:
+    SENDGRID_AVAILABLE = False
 
 # Import Bloomberg API
 try:
@@ -268,6 +285,102 @@ def fetch_bloomberg_greeks(df):
             session.stop()
 
 
+def send_email_with_attachment(recipient_email, subject, body, excel_file_bytes, filename):
+    """
+    Envoie un email avec le fichier Excel en pièce jointe via SendGrid API
+    """
+
+    # Vérifier si SendGrid est disponible
+    if not SENDGRID_AVAILABLE:
+        st.error("❌ SendGrid non installé")
+        st.code("pip install sendgrid", language="bash")
+        return False, "❌ SendGrid non installé. Exécutez: pip install sendgrid"
+
+    try:
+        # Configuration SendGrid
+        api_key = st.secrets.get("sendgrid", {}).get("API_KEY", "")
+        sender_email = st.secrets.get("sendgrid", {}).get("SENDER_EMAIL", "")
+        sender_name = st.secrets.get("sendgrid", {}).get("SENDER_NAME", "Risk Monitor")
+
+        # Debug : afficher la config (sans révéler la clé complète)
+        st.info(f"📋 Configuration:")
+        st.write(
+            f"- API Key: {'✅ Présente' if api_key else '❌ Manquante'} ({api_key[:10] + '...' if api_key else 'Aucune'})")
+        st.write(f"- Sender: {sender_email if sender_email else '❌ Manquant'}")
+        st.write(f"- Recipient: {recipient_email}")
+
+        if not api_key or not sender_email:
+            error_msg = "⚠️ Configuration SendGrid incomplète:\n"
+            if not api_key:
+                error_msg += "- API_KEY manquante\n"
+            if not sender_email:
+                error_msg += "- SENDER_EMAIL manquant\n"
+            error_msg += "\nAjoutez ces infos dans .streamlit/secrets.toml"
+            st.error(error_msg)
+            return False, error_msg
+
+        st.info("📧 Création du message...")
+
+        # Créer le message
+        message = Mail(
+            from_email=(sender_email, sender_name),
+            to_emails=recipient_email,
+            subject=subject,
+            html_content=body.replace('\n', '<br>')
+        )
+
+        st.info(f"📎 Encodage du fichier ({len(excel_file_bytes)} bytes)...")
+
+        # Encoder le fichier en base64
+        encoded_file = base64.b64encode(excel_file_bytes).decode()
+
+        st.info(f"📎 Fichier encodé: {len(encoded_file)} caractères")
+
+        # Créer l'attachement
+        attached_file = Attachment(
+            FileContent(encoded_file),
+            FileName(filename),
+            FileType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+            Disposition('attachment')
+        )
+        message.attachment = attached_file
+
+        st.info("🚀 Envoi via SendGrid...")
+
+        # Envoyer l'email
+        sg = SendGridAPIClient(api_key)
+        response = sg.send(message)
+
+        st.info(f"📬 Réponse SendGrid: Code {response.status_code}")
+
+        if response.status_code in [200, 201, 202]:
+            success_msg = f"✅ Email envoyé avec succès à {recipient_email}!\n\nCode: {response.status_code}\nVérifiez votre boîte de réception (et les spams)"
+            return True, success_msg
+        else:
+            return False, f"❌ Erreur SendGrid (Code {response.status_code})\nHeaders: {response.headers}"
+
+    except Exception as e:
+        error_msg = str(e)
+        st.error(f"💥 Exception: {error_msg}")
+
+        # Messages d'erreur spécifiques
+        if "401" in error_msg or "Unauthorized" in error_msg:
+            detailed_error = "❌ Clé API SendGrid invalide\n\nVérifiez:\n1. La clé dans secrets.toml est complète\n2. La clé n'a pas expiré\n3. Créez une nouvelle clé sur https://app.sendgrid.com/settings/api_keys"
+            st.error(detailed_error)
+            return False, detailed_error
+        elif "403" in error_msg or "Forbidden" in error_msg:
+            detailed_error = "❌ Accès refusé par SendGrid\n\nPossibles causes:\n1. Email expéditeur non vérifié\n2. Compte SendGrid suspendu\n3. Permissions API insuffisantes"
+            st.error(detailed_error)
+            return False, detailed_error
+        elif "The from email does not contain a valid address" in error_msg:
+            detailed_error = f"❌ Email expéditeur invalide: {sender_email}\n\nVérifiez SENDER_EMAIL dans secrets.toml"
+            st.error(detailed_error)
+            return False, detailed_error
+        else:
+            detailed_error = f"❌ Erreur SendGrid:\n{error_msg}\n\nType: {type(e).__name__}"
+            st.error(detailed_error)
+            return False, detailed_error
+
 # ============================================================================
 # FONCTIONS DE CALCUL DES GREEKS (Black-76 et Bachelier)
 # ============================================================================
@@ -329,18 +442,146 @@ def bachelier_greeks(F: float, K: float, T: float, r: float, sigma: float, optio
     if option_type == "C":
         price = df * ((F - K) * Nd + sigma_normal * sqrtT * nd)
         delta = df * Nd
-    else:
+        # Theta pour Call
+        theta = (-sigma_normal * nd * df) / (2 * sqrtT) - r * price
+        # Rho pour Call
+        rho = -T * price
+    else:  # PUT
         price = df * ((K - F) * norm_cdf(-d) + sigma_normal * sqrtT * nd)
         delta = df * (Nd - 1.0)
+        # Theta pour Put
+        theta = (-sigma_normal * nd * df) / (2 * sqrtT) - r * price
+        # Rho pour Put
+        rho = -T * price
 
     gamma = df * nd / (sigma_normal * sqrtT)
     vega = df * sqrtT * nd
-    theta = None
-    rho = None
 
     return {"delta": delta, "gamma": gamma, "vega": vega, "theta": theta, "rho": rho, "price": price}
 
 
+# ============================================================================
+# FONCTIONS HESTON MODEL
+# ============================================================================
+
+def heston_charfunc(phi, S0, v0, kappa, theta, sigma, rho, lambd, tau, r):
+    """
+    Calculate the Heston characteristic function.
+    Adapté pour les options sur futures.
+    """
+    a = kappa * theta
+    b = kappa + lambd
+
+    rspi = rho * sigma * phi * 1j
+    d = np.sqrt((rho * sigma * phi * 1j - b) ** 2 + (phi * 1j + phi ** 2) * sigma ** 2)
+    g = (b - rspi + d) / (b - rspi - d)
+
+    d_tau = d * tau
+    g_exp_d_tau = g * np.exp(np.clip(d_tau, -100, 100))
+
+    denom_term2 = 1 - g
+    denom_term2 = np.where(np.abs(denom_term2) < 1e-10, 1e-10, denom_term2)
+
+    num_term2 = 1 - g_exp_d_tau
+    num_term2 = np.where(np.abs(num_term2) < 1e-10, 1e-10, num_term2)
+
+    exp1 = np.exp(r * phi * 1j * tau)
+    term2 = S0 ** (phi * 1j) * (num_term2 / denom_term2) ** (-2 * a / sigma ** 2)
+
+    numerator = 1 - np.exp(np.clip(d_tau, -100, 100))
+    denominator = 1 - g_exp_d_tau
+    denominator = np.where(np.abs(denominator) < 1e-10, 1e-10, denominator)
+
+    ratio = numerator / denominator
+
+    exp_arg = (a * tau * (b - rspi + d) / sigma ** 2 +
+               v0 * (b - rspi + d) * ratio / sigma ** 2)
+
+    exp_arg_real = np.real(exp_arg)
+    exp_arg = np.where(exp_arg_real > 100, 100 + 1j * np.imag(exp_arg), exp_arg)
+    exp_arg = np.where(exp_arg_real < -100, -100 + 1j * np.imag(exp_arg), exp_arg)
+
+    exp2 = np.exp(exp_arg)
+    result = exp1 * term2 * exp2
+
+    result = np.where(np.isfinite(result), result, 0 + 0j)
+
+    return result
+
+def heston_price_rec(S0, K, v0, kappa, theta, sigma, rho, lambd, tau, r):
+    """
+    Price European call options using Heston model with rectangular integration.
+    """
+    args = (S0, v0, kappa, theta, sigma, rho, lambd, tau, r)
+
+    P, umax, N = 0, 100, 10000
+    dphi = umax / N
+
+    for i in range(1, N):
+        phi = dphi * (2 * i + 1) / 2
+        numerator = (np.exp(r * tau) * heston_charfunc(phi - 1j, *args) -
+                     K * heston_charfunc(phi, *args))
+        denominator = 1j * phi * K ** (1j * phi)
+        P += dphi * numerator / denominator
+
+    return np.real((S0 - K * np.exp(-r * tau)) / 2 + P / np.pi)
+
+def heston_greeks(F, K, T, r, v0, kappa, theta, sigma, rho, lambd, option_type):
+    """
+    Calcule les Greeks Heston par différences finies.
+    """
+    if T <= 0 or v0 <= 0 or F <= 0 or K <= 0:
+        return {"delta": None, "gamma": None, "vega": None, "theta": None, "rho": None, "price": None}
+
+    # Prix de base
+    price = heston_price_rec(F, K, v0, kappa, theta, sigma, rho, lambd, T, r)
+
+    # Delta (sensibilité au prix du sous-jacent)
+    dF = 0.01 * F
+    price_up = heston_price_rec(F + dF, K, v0, kappa, theta, sigma, rho, lambd, T, r)
+    price_down = heston_price_rec(F - dF, K, v0, kappa, theta, sigma, rho, lambd, T, r)
+    delta = (price_up - price_down) / (2 * dF)
+
+    # Gamma (sensibilité du delta)
+    gamma = (price_up - 2 * price + price_down) / (dF ** 2)
+
+    # Vega (sensibilité à la volatilité initiale)
+    dv = 0.01 * v0
+    price_vega_up = heston_price_rec(F, K, v0 + dv, kappa, theta, sigma, rho, lambd, T, r)
+    vega = (price_vega_up - price) / dv
+
+    # Theta (sensibilité au temps)
+    dT = 1 / 365  # 1 jour
+    if T > dT:
+        price_theta = heston_price_rec(F, K, v0, kappa, theta, sigma, rho, lambd, T - dT, r)
+        theta = (price_theta - price) / dT
+    else:
+        theta = None
+
+    # Rho (sensibilité au taux sans risque)
+    dr = 0.01
+    price_rho = heston_price_rec(F, K, v0, kappa, theta, sigma, rho, lambd, T, r + dr)
+    rho_greek = (price_rho - price) / dr
+
+    # Ajuster pour Put si nécessaire
+    option_type = option_type.upper()[0]
+    if option_type == "P":
+        # Put-Call parity: P = C - F*e^(-rT) + K*e^(-rT)
+        df = np.exp(-r * T)
+        price = price - F * df + K * df
+        delta = delta - df
+        # Gamma et Vega sont identiques pour Put et Call
+
+    return {
+        "delta": delta,
+        "gamma": gamma,
+        "vega": vega,
+        "theta": theta,
+        "rho": rho_greek,
+        "price": price
+    }
+
+# ============================================================================
 def safe_time_to_maturity(maturity_value, today: date) -> float:
     """Convertit la maturité en T (années)."""
 
@@ -499,10 +740,20 @@ def compute_bachelier_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05
             return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
 
         T = safe_time_to_maturity(row["Maturity"], valuation_date)
-        F = row.get("Settlement_Price", row.get("Settlement Price", 0))
-        K = row.get("Strike", row.get("Strike_Px", row.get("Strike Px", 0)))  # ← MODIFIÉ
+        K = row.get("Strike", row.get("Strike_Px", row.get("Strike Px", 0)))
 
-        if F == 0 or K == 0:
+        # ⚠️ MODIFICATION : Récupérer le prix du future depuis Bloomberg (comme pour B76)
+        ticker = row.get('Ticker', '')
+        F = None
+        if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
+            bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
+            F = bbg_row.get('Underlying_Price', None)
+
+        # Si pas de prix du future Bloomberg, utiliser une valeur par défaut
+        if F is None or pd.isna(F) or F == 0:
+            F = K  # Approximation : ATM
+
+        if K == 0:
             return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
 
         # Récupérer l'IV depuis Bloomberg si disponible
@@ -544,6 +795,57 @@ def compute_bachelier_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05
         return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
 
 
+def compute_heston_greeks_for_position(row, bloomberg_df, heston_params, risk_free_rate=0.05, valuation_date=None):
+    """Calcule les Greeks Heston pour une position"""
+    if valuation_date is None:
+        valuation_date = datetime.today().date()
+
+    try:
+        if "Maturity" not in row or pd.isna(row["Maturity"]):
+            return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
+
+        T = safe_time_to_maturity(row["Maturity"], valuation_date)
+        K = row.get("Strike", row.get("Strike_Px", row.get("Strike Px", 0)))
+
+        # Récupérer le prix du future depuis Bloomberg
+        ticker = row.get('Ticker', '')
+        F = None
+        if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
+            bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
+            F = bbg_row.get('Underlying_Price', None)
+
+        if F is None or pd.isna(F) or F == 0:
+            F = K
+
+        if K == 0:
+            return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
+
+        option_type = row.get("Type", row.get("Put_Call", "C"))
+
+        # Utiliser les paramètres Heston calibrés
+        greeks = heston_greeks(
+            F=float(F), K=float(K), T=float(T), r=float(risk_free_rate),
+            v0=heston_params['v0'],
+            kappa=heston_params['kappa'],
+            theta=heston_params['theta'],
+            sigma=heston_params['sigma'],
+            rho=heston_params['rho'],
+            lambd=heston_params['lambd'],
+            option_type=option_type
+        )
+
+        return {
+            "Delta": greeks["delta"],
+            "Gamma": greeks["gamma"],
+            "Vega": greeks["vega"],
+            "Theta": greeks["theta"],
+            "Rho": greeks["rho"],
+            "Price": greeks["price"]
+        }
+    except Exception as e:
+        print(f"Erreur calcul Heston: {e}")
+        return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
+
 # ============================================================================
 # CONFIGURATION STREAMLIT
 # ============================================================================
@@ -577,7 +879,19 @@ if 'show_positions' not in st.session_state:
 if 'risk_free_rate' not in st.session_state:
     st.session_state.risk_free_rate = 0.05
 
+if 'heston_greeks' not in st.session_state:
+    st.session_state.heston_greeks = pd.DataFrame()
 
+if 'heston_params' not in st.session_state:
+    # Paramètres par défaut (tu pourras les calibrer)
+    st.session_state.heston_params = {
+        'v0': 0.04,      # Initial variance
+        'kappa': 2.0,    # Mean reversion speed
+        'theta': 0.04,   # Long-term variance
+        'sigma': 0.3,    # Vol of vol
+        'rho': -0.7,     # Correlation
+        'lambd': 0.0     # Market price of vol risk
+    }
 # ============================================================================
 # FONCTION DE CALCUL PRINCIPALE
 # ============================================================================
@@ -698,6 +1012,52 @@ def run_calculation():
 
     st.session_state.bachelier_greeks = pd.DataFrame(bach_results)
 
+    # 4. CALCUL HESTON
+    heston_results = []
+    for idx, row in st.session_state.positions.iterrows():
+        greeks = compute_heston_greeks_for_position(
+            row, bloomberg_df, st.session_state.heston_params, st.session_state.risk_free_rate
+        )
+
+        ticker = row.get('Ticker', '')
+        position_size = row.get('Size', row.get('Position_Size', 0))
+        strike = row.get('Strike Px', row.get('Strike_Px', row.get('Strike', 0)))
+        settlement_price = row.get('Settlement Price', row.get('Settlement_Price', 0))
+
+        # Récupérer les données de prix depuis Bloomberg
+        bid = None
+        ask = None
+        last_price = None
+        iv = None
+
+        if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
+            bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
+            bid = bbg_row.get('Bid', None)
+            ask = bbg_row.get('Ask', None)
+            last_price = bbg_row.get('Last_Price', None)
+            iv = bbg_row.get('IV', None)
+
+        result = {
+            'Product': ticker,
+            'Position_Size': position_size,
+            'Strike_px': strike,
+            'Settlement_Price': settlement_price,
+            'Bid': bid,
+            'Ask': ask,
+            'Last_Price': last_price,
+            'IV': iv,
+            'Delta': greeks['Delta'],
+            'Gamma': greeks['Gamma'],
+            'Vega': greeks['Vega'],
+            'Theta': greeks['Theta'],
+            'Rho': greeks['Rho'],
+            'Price': greeks['Price'],
+            'PnL': calculate_pnl(row, last_price)
+        }
+        heston_results.append(result)
+
+    st.session_state.heston_greeks = pd.DataFrame(heston_results)
+
     st.success("✅ Greeks calculés avec succès!")
 
 def save_data():
@@ -706,7 +1066,9 @@ def save_data():
         'b76_greeks': st.session_state.b76_greeks.to_dict(),
         'bachelier_greeks': st.session_state.bachelier_greeks.to_dict(),
         'bloomberg_greeks': st.session_state.bloomberg_greeks.to_dict(),
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'heston_greeks': st.session_state.heston_greeks.to_dict(),
+        'heston_params': st.session_state.heston_params
     }
     with open('risk_monitor_data.json', 'w') as f:
         json.dump(data, f)
@@ -725,6 +1087,23 @@ with st.sidebar:
     else:
         st.error("❌ Bloomberg API non disponible")
         st.code("pip install blpapi", language="bash")
+
+    # ← AJOUT: Statut SendGrid
+    st.markdown("### SendGrid Status")
+    if SENDGRID_AVAILABLE:
+        api_key = st.secrets.get("sendgrid", {}).get("API_KEY", "")
+        if api_key:
+            st.success("✅ SendGrid configuré")
+        else:
+            st.warning("⚠️ SendGrid installé mais non configuré")
+            with st.expander("Configuration requise"):
+                st.code("""[sendgrid]
+API_KEY = "votre_cle_api"
+SENDER_EMAIL = "votre.email@gmail.com"
+SENDER_NAME = "Risk Monitor" """)
+    else:
+        st.error("❌ SendGrid non installé")
+        st.code("pip install sendgrid", language="bash")
 
     mode = st.radio(
         "Mode de travail",
@@ -758,7 +1137,7 @@ with st.sidebar:
 
     st.subheader("Actions")
 
-    if st.button("🔄 Actualiser avec Bloomberg", use_container_width=True, type="primary"):
+    if st.button("Calculer les risques", use_container_width=True, type="primary"):
         if not st.session_state.positions.empty:
             with st.spinner("Calcul en cours..."):
                 run_calculation()
@@ -767,41 +1146,221 @@ with st.sidebar:
         else:
             st.warning("Aucune position a calculer")
 
-    if st.button("Modifier ou Supprimer une position", use_container_width=True):
-        st.session_state.show_positions = True
-
     st.markdown("---")
 
     st.subheader("Export")
 
     if not st.session_state.positions.empty:
-        if st.button("Export Excel", use_container_width=True):
-            output_file = f"risk_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-                st.session_state.positions.to_excel(writer, sheet_name='Positions', index=False)
+        # Créer les boutons en 3 colonnes
+        export_col1, export_col2, export_col3 = st.columns(3)
 
-                if not st.session_state.b76_greeks.empty:
-                    st.session_state.b76_greeks.to_excel(writer, sheet_name='B76_Greeks', index=False)
+        with export_col1:
+            if st.button("📊 Excel", use_container_width=True):
+                output_file = f"risk_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                    st.session_state.positions.to_excel(writer, sheet_name='Positions', index=False)
 
-                if not st.session_state.bachelier_greeks.empty:
-                    st.session_state.bachelier_greeks.to_excel(writer, sheet_name='Bachelier_Greeks', index=False)
+                    if not st.session_state.b76_greeks.empty:
+                        export_b76 = st.session_state.b76_greeks.copy()
+                        export_b76['Delta'] = export_b76['Delta'] * export_b76['Position_Size']
+                        export_b76['Gamma'] = export_b76['Gamma'] * export_b76['Position_Size']
+                        export_b76['Vega'] = export_b76['Vega'] * export_b76['Position_Size']
+                        export_b76['Theta'] = export_b76['Theta'] * export_b76['Position_Size']
+                        export_b76['Rho'] = export_b76['Rho'] * export_b76['Position_Size']
+                        export_b76.to_excel(writer, sheet_name='B76_Greeks', index=False)
 
-                if not st.session_state.bloomberg_greeks.empty:
-                    st.session_state.bloomberg_greeks.to_excel(writer, sheet_name='Bloomberg_Greeks', index=False)
+                    if not st.session_state.bachelier_greeks.empty:
+                        export_bach = st.session_state.bachelier_greeks.copy()
+                        export_bach['Delta'] = export_bach['Delta'] * export_bach['Position_Size']
+                        export_bach['Gamma'] = export_bach['Gamma'] * export_bach['Position_Size']
+                        export_bach['Vega'] = export_bach['Vega'] * export_bach['Position_Size']
+                        export_bach['Theta'] = export_bach['Theta'] * export_bach['Position_Size']
+                        export_bach['Rho'] = export_bach['Rho'] * export_bach['Position_Size']
+                        export_bach.to_excel(writer, sheet_name='Bachelier_Greeks', index=False)
 
-                if st.session_state.rates_data is not None:
-                    st.session_state.rates_data.to_excel(writer, sheet_name='US_Rates_Curve', index=False)
+                    if not st.session_state.heston_greeks.empty:
+                        export_heston = st.session_state.heston_greeks.copy()
+                        export_heston['Delta'] = export_heston['Delta'] * export_heston['Position_Size']
+                        export_heston['Gamma'] = export_heston['Gamma'] * export_heston['Position_Size']
+                        export_heston['Vega'] = export_heston['Vega'] * export_heston['Position_Size']
+                        export_heston['Theta'] = export_heston['Theta'] * export_heston['Position_Size']
+                        export_heston['Rho'] = export_heston['Rho'] * export_heston['Position_Size']
+                        export_heston.to_excel(writer, sheet_name='Heston_Greeks', index=False)
 
-            st.success(f"Fichier exporte : {output_file}")
+                    if not st.session_state.bloomberg_greeks.empty:
+                        export_bbg = st.session_state.bloomberg_greeks.copy()
+                        export_bbg['Delta'] = export_bbg['Delta'] * export_bbg['Position_Size']
+                        export_bbg['Gamma'] = export_bbg['Gamma'] * export_bbg['Position_Size']
+                        export_bbg['Vega'] = export_bbg['Vega'] * export_bbg['Position_Size']
+                        export_bbg['Theta'] = export_bbg['Theta'] * export_bbg['Position_Size']
+                        export_bbg['Rho'] = export_bbg['Rho'] * export_bbg['Position_Size']
+                        export_bbg.to_excel(writer, sheet_name='Bloomberg_Greeks', index=False)
 
-        csv = st.session_state.positions.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Export CSV",
-            data=csv,
-            file_name=f"positions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+                    if st.session_state.rates_data is not None:
+                        st.session_state.rates_data.to_excel(writer, sheet_name='US_Rates_Curve', index=False)
+
+                st.success(f"✅ Fichier exporté : {output_file}")
+
+        with export_col2:
+            csv = st.session_state.positions.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📄 CSV",
+                data=csv,
+                file_name=f"positions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        with export_col3:
+            if st.button("📧 Email", use_container_width=True):
+                st.session_state.show_email_form = True
+
+        # Formulaire d'envoi d'email (apparaît sous les boutons)
+        if st.session_state.get('show_email_form', False):
+            st.markdown("---")
+            st.markdown("##### 📧 Envoyer par Email")
+
+            with st.form("email_form"):
+                recipient = st.text_input(
+                    "Email destinataire",
+                    placeholder="exemple@domaine.com"
+                )
+
+                email_subject = st.text_input(
+                    "Sujet",
+                    value=f"Risk Monitor Report - {datetime.now().strftime('%Y-%m-%d')}"
+                )
+
+                email_body = st.text_area(
+                    "Message",
+                    value=f"""Bonjour,
+
+Veuillez trouver ci-joint le rapport Risk Monitor.
+
+Nombre de positions: {len(st.session_state.positions)}
+Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Cordialement,
+Risk Monitor System""",
+                    height=150
+                )
+
+                submit_email = st.form_submit_button("✉️ Envoyer", use_container_width=True)
+
+                if submit_email:
+                    if not recipient or '@' not in recipient:
+                        st.error("❌ Veuillez entrer une adresse email valide")
+                    else:
+                        # Créer le fichier Excel en mémoire
+                        output = io.BytesIO()
+                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                            st.session_state.positions.to_excel(writer, sheet_name='Positions', index=False)
+
+                            if not st.session_state.b76_greeks.empty:
+                                export_b76 = st.session_state.b76_greeks.copy()
+                                export_b76['Delta'] = export_b76['Delta'] * export_b76['Position_Size']
+                                export_b76['Gamma'] = export_b76['Gamma'] * export_b76['Position_Size']
+                                export_b76['Vega'] = export_b76['Vega'] * export_b76['Position_Size']
+                                export_b76['Theta'] = export_b76['Theta'] * export_b76['Position_Size']
+                                export_b76['Rho'] = export_b76['Rho'] * export_b76['Position_Size']
+                                export_b76.to_excel(writer, sheet_name='B76_Greeks', index=False)
+
+                            if not st.session_state.bachelier_greeks.empty:
+                                export_bach = st.session_state.bachelier_greeks.copy()
+                                export_bach['Delta'] = export_bach['Delta'] * export_bach['Position_Size']
+                                export_bach['Gamma'] = export_bach['Gamma'] * export_bach['Position_Size']
+                                export_bach['Vega'] = export_bach['Vega'] * export_bach['Position_Size']
+                                export_bach['Theta'] = export_bach['Theta'] * export_bach['Position_Size']
+                                export_bach['Rho'] = export_bach['Rho'] * export_bach['Position_Size']
+                                export_bach.to_excel(writer, sheet_name='Bachelier_Greeks', index=False)
+
+                            if not st.session_state.heston_greeks.empty:
+                                export_heston = st.session_state.heston_greeks.copy()
+                                export_heston['Delta'] = export_heston['Delta'] * export_heston['Position_Size']
+                                export_heston['Gamma'] = export_heston['Gamma'] * export_heston['Position_Size']
+                                export_heston['Vega'] = export_heston['Vega'] * export_heston['Position_Size']
+                                export_heston['Theta'] = export_heston['Theta'] * export_heston['Position_Size']
+                                export_heston['Rho'] = export_heston['Rho'] * export_heston['Position_Size']
+                                export_heston.to_excel(writer, sheet_name='Heston_Greeks', index=False)
+
+                            if not st.session_state.bloomberg_greeks.empty:
+                                export_bbg = st.session_state.bloomberg_greeks.copy()
+                                export_bbg['Delta'] = export_bbg['Delta'] * export_bbg['Position_Size']
+                                export_bbg['Gamma'] = export_bbg['Gamma'] * export_bbg['Position_Size']
+                                export_bbg['Vega'] = export_bbg['Vega'] * export_bbg['Position_Size']
+                                export_bbg['Theta'] = export_bbg['Theta'] * export_bbg['Position_Size']
+                                export_bbg['Rho'] = export_bbg['Rho'] * export_bbg['Position_Size']
+                                export_bbg.to_excel(writer, sheet_name='Bloomberg_Greeks', index=False)
+
+                            if st.session_state.rates_data is not None:
+                                st.session_state.rates_data.to_excel(writer, sheet_name='US_Rates_Curve', index=False)
+
+                        excel_data = output.getvalue()
+                        filename = f"risk_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+                        with st.spinner("📤 Envoi en cours..."):
+                            success, message = send_email_with_attachment(
+                                recipient,
+                                email_subject,
+                                email_body,
+                                excel_data,
+                                filename
+                            )
+
+                        if success:
+                            st.success(f"✅ {message}")
+                            st.session_state.show_email_form = False
+                            st.rerun()
+                        else:
+                            st.error(f"{message}")
+
+            if st.button("❌ Annuler", use_container_width=True):
+                st.session_state.show_email_form = False
+                st.rerun()
+
+    st.markdown("---")
+    st.subheader("🔍 Diagnostic Réseau")
+
+    if st.button("Tester les ports SMTP", use_container_width=True):
+        results = []
+
+        # Test port 587
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            result = sock.connect_ex(('smtp.gmail.com', 587))
+            sock.close()
+            if result == 0:
+                results.append(("success", "✅ Port 587 (TLS): Accessible"))
+            else:
+                results.append(("error", "❌ Port 587 (TLS): Bloqué"))
+        except Exception as e:
+            results.append(("error", "❌ Port 587: Bloqué"))
+
+        # Test port 465
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            result = sock.connect_ex(('smtp.gmail.com', 465))
+            sock.close()
+            if result == 0:
+                results.append(("success", "✅ Port 465 (SSL): Accessible"))
+            else:
+                results.append(("error", "❌ Port 465 (SSL): Bloqué"))
+        except Exception as e:
+            results.append(("error", "❌ Port 465: Bloqué"))
+
+        # Afficher les résultats
+        for status, msg in results:
+            if status == "success":
+                st.success(msg)
+            else:
+                st.error(msg)
+
+        # Recommandations
+        accessible_ports = [r for r in results if r[0] == "success"]
+        if not accessible_ports:
+            st.warning("⚠️ Ports SMTP bloqués → Utilisez SendGrid")
 
 # ============================================================================
 # AFFICHAGE PRINCIPAL
@@ -811,7 +1370,7 @@ df = st.session_state.positions
 
 # Metrics en haut
 if not df.empty:
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
         st.metric(
@@ -848,6 +1407,18 @@ if not df.empty:
             )
         else:
             st.metric(label="Gamma Total", value="0.00")
+
+    with col5:
+        if not st.session_state.b76_greeks.empty and 'PnL' in st.session_state.b76_greeks.columns:
+            total_pnl = st.session_state.b76_greeks['PnL'].dropna().sum()
+            st.metric(
+                label="PnL Total",
+                value=f"${total_pnl:,.2f}",
+                delta=f"${total_pnl:,.2f}" if total_pnl != 0 else None,
+                delta_color="normal" if total_pnl >= 0 else "inverse"
+            )
+        else:
+            st.metric(label="PnL Total", value="$0.00")
 
     st.markdown("---")
 
@@ -941,7 +1512,7 @@ if selected_tab == "Positions":
 
         st.markdown("### Tableau des Positions")
         st.info(
-            "Editez directement les valeurs dans le tableau ci-dessous. Les modifications seront sauvegardees automatiquement.")
+            "Editez directement les valeurs dans le tableau ci-dessous, puis appuyer sur Enregistrer")
 
         edited_df = st.data_editor(
             df_filtered,
@@ -1025,7 +1596,7 @@ if selected_tab == "Greeks":
             total_vega_bbg = display_df['Vega'].dropna().sum()
             st.metric("Vega Total", f"{total_vega_bbg:.4f}")
     else:
-        st.info("Aucune donnee Bloomberg. Cliquez sur 'Actualiser avec Bloomberg' pour calculer.")
+        st.info("Aucune donnee Bloomberg. Cliquez sur 'Calculer les risques' pour calculer.")
 
     st.markdown("---")
 
@@ -1106,6 +1677,57 @@ if selected_tab == "Greeks":
             st.metric("Vega Total", f"{total_vega_bach:.4f}")
     else:
         st.info("Aucune donnee Bachelier. Cliquez sur 'Actualiser avec Bloomberg' pour calculer.")
+
+    st.markdown("---")
+
+    st.markdown("### Heston Model")
+    if not st.session_state.heston_greeks.empty:
+        # Créer une copie du dataframe avec les Greeks pondérés
+        display_df_heston = st.session_state.heston_greeks.copy()
+        display_df_heston['Delta'] = display_df_heston['Delta'] * display_df_heston['Position_Size']
+        display_df_heston['Gamma'] = display_df_heston['Gamma'] * display_df_heston['Position_Size']
+        display_df_heston['Vega'] = display_df_heston['Vega'] * display_df_heston['Position_Size']
+        display_df_heston['Theta'] = display_df_heston['Theta'] * display_df_heston['Position_Size']
+        display_df_heston['Rho'] = (display_df_heston['Rho'] * display_df_heston['Position_Size']).round(4)
+
+        st.dataframe(
+            display_df_heston,
+            use_container_width=True,
+            height=250,
+            column_config={
+                "Position_Size": st.column_config.NumberColumn("Position Size", format="%.0f"),
+                "Strike_px": st.column_config.NumberColumn("Strike", format="%.2f"),
+                "Settlement_Price": st.column_config.NumberColumn("Settlement Price", format="%.4f"),
+                "Bid": st.column_config.NumberColumn("Bid", format="%.4f"),
+                "Ask": st.column_config.NumberColumn("Ask", format="%.4f"),
+                "Last_Price": st.column_config.NumberColumn("Last Price", format="%.4f"),
+                "IV": st.column_config.NumberColumn("IV (%)", format="%.2f"),
+                "Delta": st.column_config.NumberColumn("Delta", format="%.4f"),
+                "Gamma": st.column_config.NumberColumn("Gamma", format="%.6f"),
+                "Vega": st.column_config.NumberColumn("Vega", format="%.4f"),
+                "Theta": st.column_config.NumberColumn("Theta", format="%.4f"),
+                "Rho": st.column_config.NumberColumn("Rho", format="%.4f"),
+                "Price": st.column_config.NumberColumn("Model Price", format="%.4f"),
+                "PnL": st.column_config.NumberColumn("P&L", format="%.2f")
+            }
+        )
+
+        # Afficher les totaux Heston
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            total_delta_heston = display_df_heston['Delta'].dropna().sum()
+            st.metric("Delta Total", f"{total_delta_heston:.4f}")
+        with col2:
+            total_gamma_heston = display_df_heston['Gamma'].dropna().sum()
+            st.metric("Gamma Total", f"{total_gamma_heston:.6f}")
+        with col3:
+            total_vega_heston = display_df_heston['Vega'].dropna().sum()
+            st.metric("Vega Total", f"{total_vega_heston:.4f}")
+        with col4:
+            total_theta_heston = display_df_heston['Theta'].dropna().sum()
+            st.metric("Theta Total", f"{total_theta_heston:.4f}")
+    else:
+        st.info("Aucune donnee Heston. Cliquez sur 'Actualiser avec Bloomberg' pour calculer.")
 
 if selected_tab == "Courbe des Taux":
     st.subheader("Courbe des Taux US Treasury")
