@@ -141,6 +141,30 @@ def calculate_pnl(row, last_price):
         print(f"Erreur calcul P&L: {e}")
         return None
 
+
+def get_underlying_future_ticker(option_ticker):
+    """
+    Extrait le ticker du future sous-jacent depuis le ticker de l'option
+    Exemple: 'CLG6C 58.50 Comdty' → 'CLG6 Comdty'
+    """
+    if not isinstance(option_ticker, str):
+        return None
+
+    # Supprimer 'C' ou 'P' à la fin + ' Comdty'
+    parts = option_ticker.split()
+    if len(parts) < 2:
+        return None
+
+    option_code = parts[0]  # 'CLG6C' ou 'CLG6P'
+
+    # Enlever le dernier caractère (C ou P)
+    if option_code and option_code[-1] in ['C', 'P']:
+        future_code = option_code[:-1]  # 'CLG6'
+        return f"{future_code} Comdty"
+
+    return None
+
+
 def fetch_bloomberg_greeks(df):
     """
     Récupère les Greeks et prix depuis Bloomberg pour toutes les positions
@@ -159,19 +183,39 @@ def fetch_bloomberg_greeks(df):
 
     tickers = df['Ticker'].tolist()
 
+    # Extraire les tickers des futures sous-jacents
+    underlying_tickers = []
+    ticker_to_underlying = {}
+    for ticker in tickers:
+        underlying = get_underlying_future_ticker(ticker)
+        if underlying and underlying not in underlying_tickers:
+            underlying_tickers.append(underlying)
+        ticker_to_underlying[ticker] = underlying
+
     with st.spinner(f"📡 Récupération des données Bloomberg pour {len(tickers)} positions..."):
         try:
+            # Récupérer les données des options
             bloomberg_data = get_bloomberg_data_batch(session, tickers, bloomberg_fields)
+
+            # Récupérer les prix des futures sous-jacents
+            underlying_prices = {}
+            if underlying_tickers:
+                underlying_data = get_bloomberg_data_batch(session, underlying_tickers, ['PX_LAST'])
+                for fut_ticker, data in underlying_data.items():
+                    underlying_prices[fut_ticker] = data.get('PX_LAST', None)
 
             # Créer un nouveau DataFrame avec les résultats Bloomberg
             bbg_results = []
 
             for idx, row in df.iterrows():
                 ticker = row.get('Ticker', '')
-                # Utiliser 'Size' au lieu de 'Position_Size'
                 position_size = row.get('Size', row.get('Position_Size', 0))
-                strike = row.get('Strike Px',row.get('Strike_Px', row.get('Strike', 0)))  # MODIFIÉ - essaie différents noms
+                strike = row.get('Strike Px', row.get('Strike_Px', row.get('Strike', 0)))
                 settlement_price = row.get('Settlement Price', row.get('Settlement_Price', 0))
+
+                # Récupérer le prix du future sous-jacent
+                underlying_ticker = ticker_to_underlying.get(ticker)
+                underlying_price = underlying_prices.get(underlying_ticker, None) if underlying_ticker else None
 
                 if ticker in bloomberg_data:
                     last_price = bloomberg_data[ticker].get('PX_LAST', None)
@@ -179,11 +223,12 @@ def fetch_bloomberg_greeks(df):
                     result = {
                         'Product': ticker,
                         'Position_Size': position_size,
-                        'Strike_px': strike,  # Cette colonne existera maintenant
+                        'Strike_px': strike,
                         'Settlement_Price': settlement_price,
                         'Bid': bloomberg_data[ticker].get('BID', None),
                         'Ask': bloomberg_data[ticker].get('ASK', None),
                         'Last_Price': bloomberg_data[ticker].get('PX_LAST', None),
+                        'Underlying_Price': underlying_price,  # ← AJOUT
                         'IV': bloomberg_data[ticker].get('IVOL_MID', None),
                         'Delta': bloomberg_data[ticker].get('OPT_DELTA', None),
                         'Gamma': bloomberg_data[ticker].get('OPT_GAMMA', None),
@@ -201,6 +246,7 @@ def fetch_bloomberg_greeks(df):
                         'Bid': None,
                         'Ask': None,
                         'Last_Price': None,
+                        'Underlying_Price': underlying_price,  # ← AJOUT
                         'IV': None,
                         'Delta': None,
                         'Gamma': None,
@@ -245,19 +291,22 @@ def black76_greeks(F: float, K: float, T: float, r: float, sigma: float, option_
     df = math.exp(-r * T)
 
     Nd1 = norm_cdf(d1)
+    Nd2 = norm_cdf(d2)
     nd1 = norm_pdf(d1)
 
     option_type = option_type.upper()[0]
 
     if option_type == "C":
         delta = df * Nd1
-    else:
+        theta = -(F * nd1 * sigma * df) / (2 * sqrtT) - r * df * (F * Nd1 - K * Nd2)
+        rho = -T * df * (F * Nd1 - K * Nd2)
+    else:  # PUT
         delta = df * (Nd1 - 1.0)
+        theta = -(F * nd1 * sigma * df) / (2 * sqrtT) + r * df * (K * norm_cdf(-d2) - F * norm_cdf(-d1))
+        rho = -T * df * (K * norm_cdf(-d2) - F * norm_cdf(-d1))
 
     gamma = df * nd1 / (F * sigma * sqrtT)
     vega = df * F * nd1 * sqrtT
-    theta = None
-    rho = None
 
     return {"delta": delta, "gamma": gamma, "vega": vega, "theta": theta, "rho": rho}
 
@@ -294,60 +343,129 @@ def bachelier_greeks(F: float, K: float, T: float, r: float, sigma: float, optio
 
 def safe_time_to_maturity(maturity_value, today: date) -> float:
     """Convertit la maturité en T (années)."""
+
+    # Si c'est déjà un datetime/Timestamp
     if isinstance(maturity_value, (datetime, pd.Timestamp)):
         maturity_date = maturity_value.date()
     else:
+        # Essayer de parser comme date
         try:
             m = pd.to_datetime(maturity_value, errors="coerce", dayfirst=True)
         except Exception:
             m = pd.NaT
 
+        # Si échec, essayer format "MMM YY" (ex: "FEB 26", "MAR 26")
+        if pd.isna(m) and isinstance(maturity_value, str):
+            try:
+                # Remplacer "FEB 26" → "FEB 2026"
+                maturity_str = maturity_value.strip().upper()
+                parts = maturity_str.split()
+                if len(parts) == 2:
+                    month_str = parts[0]
+                    year_str = parts[1]
+
+                    # Convertir année courte (26 → 2026)
+                    if len(year_str) == 2:
+                        year_int = int(year_str)
+                        # Si année < 50, c'est 20XX, sinon 19XX
+                        full_year = 2000 + year_int if year_int < 50 else 1900 + year_int
+                    else:
+                        full_year = int(year_str)
+
+                    # Parser avec le mois et l'année complète
+                    m = pd.to_datetime(f"{month_str} 01 {full_year}", format="%b %d %Y")
+            except Exception as e:
+                print(f"⚠️ Impossible de parser maturity '{maturity_value}': {e}")
+                m = pd.NaT
+
         if pd.isna(m):
+            print(f"⚠️ Maturity invalide '{maturity_value}' → T = 0.00001")
             return 0.00001
+
         maturity_date = m.date()
 
     days = (maturity_date - today).days
     T = days / 365.0
+
     if T <= 0:
+        print(f"⚠️ Maturity {maturity_date} est passée ou aujourd'hui → T = 0.00001")
         T = 0.00001
+
     return T
 
 
 def compute_b76_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05, valuation_date=None):
     """Calcule les Greeks Black-76 pour une position"""
+    ticker = row.get('Ticker', 'Unknown')
+
     if valuation_date is None:
         valuation_date = datetime.today().date()
 
     try:
+        # CHECK 1 : Maturity
         if "Maturity" not in row or pd.isna(row["Maturity"]):
+            print(f"❌ {ticker} : Maturity manquante ou NaN")
             return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None}
 
+        # CHECK 2 : Calcul de T
         T = safe_time_to_maturity(row["Maturity"], valuation_date)
-        F = row.get("Settlement_Price", row.get("Settlement Price", 0))
-        K = row.get("Strike", row.get("Strike_Px", 0))
 
-        if F == 0 or K == 0:
-            return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None}
+        # CHECK 3 : F (prix du FUTURE, pas de l'option) et K
+        K = row.get("Strike", row.get("Strike_Px", row.get("Strike Px", 0)))
 
-        # Récupérer l'IV depuis Bloomberg si disponible
-        ticker = row.get('Ticker', '')
-        iv = None
+        # ⚠️ MODIFICATION CRITIQUE : Récupérer le prix du future depuis Bloomberg
+        F = None
         if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
             bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
-            iv = bbg_row.get('IV', None)
+            F = bbg_row.get('Underlying_Price', None)
 
-        # Si pas d'IV Bloomberg, utiliser la colonne du tableau original
+        # Si pas de prix du future Bloomberg, utiliser une valeur par défaut ou depuis Excel
+        if F is None or pd.isna(F):
+            # Option : chercher dans une colonne Excel "Underlying_Price" ou "Future_Price"
+            F = row.get("Underlying_Price", row.get("Future_Price", None))
+
+        # Si toujours pas de prix, utiliser Strike comme approximation (mauvaise pratique mais mieux que 0)
+        if F is None or F == 0:
+            print(f"⚠️ {ticker} : Pas de prix du future disponible, utilisation du Strike comme approximation")
+            F = K  # Approximation : ATM
+
+        print(f"\n🔍 {ticker} - Maturity = {row['Maturity']}, T = {T:.4f} ans")
+        print(f"   F (Underlying Future) = {F}")
+        print(f"   K (Strike) = {K}")
+
+        if F == 0 or K == 0:
+            print(f"❌ {ticker} : F={F} ou K={K} = 0 → Greeks = None")
+            return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None}
+
+        # CHECK 4 : IV - PRIORITÉ À L'IV enrichie
+        iv = row.get('IV_Bloomberg', None)  # ← CHERCHER EN PREMIER l'IV enrichie
+        print(f"   IV Bloomberg (enrichie) = {iv}")
+
+        if iv is None or pd.isna(iv):
+            # Fallback : chercher dans bloomberg_df
+            if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
+                bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
+                iv = bbg_row.get('IV', None)
+                print(f"   IV Bloomberg (df) = {iv}")
+
         if iv is None or pd.isna(iv):
             iv = row.get("IV")
+            print(f"   IV from row = {iv}")
 
         if iv in (None, '', ' ') or pd.isna(iv):
             sigma = 0.30
+            print(f"   ⚠️ Pas d'IV → sigma par défaut = {sigma}")
         else:
             sigma = float(iv) / 100.0
+            print(f"   ✅ σ (sigma) = {sigma}")
 
+        # CHECK 5 : Option Type et Position Size
         option_type = row.get("Type", row.get("Put_Call", "C"))
-        # Utiliser 'Size' au lieu de 'Position_Size'
         position_size = row.get("Size", row.get("Position_Size", 1))
+        print(f"   Type = {option_type}, Size = {position_size}")
+
+        # CHECK 6 : Appel à black76_greeks
+        print(f"   📞 Appel black76_greeks(F={F}, K={K}, T={T:.4f}, r={risk_free_rate}, σ={sigma}, type={option_type})")
 
         greeks = black76_greeks(
             F=float(F), K=float(K), T=float(T),
@@ -355,15 +473,19 @@ def compute_b76_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05, valu
             option_type=option_type
         )
 
+        print(f"   ✅ Greeks retournés : {greeks}")
+
         return {
-            "Delta": greeks["delta"] * position_size if greeks["delta"] is not None else None,
-            "Gamma": greeks["gamma"] * position_size if greeks["gamma"] is not None else None,
-            "Vega": greeks["vega"] * position_size if greeks["vega"] is not None else None,
+            "Delta": greeks["delta"],
+            "Gamma": greeks["gamma"],
+            "Vega": greeks["vega"],
             "Theta": greeks["theta"],
             "Rho": greeks["rho"]
         }
     except Exception as e:
-        print(f"Erreur calcul B76: {e}")
+        print(f"❌ ERREUR {ticker}: {e}")
+        import traceback
+        traceback.print_exc()
         return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None}
 
 
@@ -378,7 +500,7 @@ def compute_bachelier_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05
 
         T = safe_time_to_maturity(row["Maturity"], valuation_date)
         F = row.get("Settlement_Price", row.get("Settlement Price", 0))
-        K = row.get("Strike", row.get("Strike_Px", 0))
+        K = row.get("Strike", row.get("Strike_Px", row.get("Strike Px", 0)))  # ← MODIFIÉ
 
         if F == 0 or K == 0:
             return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
@@ -410,9 +532,9 @@ def compute_bachelier_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05
         )
 
         return {
-            "Delta": greeks["delta"] * position_size if greeks["delta"] is not None else None,
-            "Gamma": greeks["gamma"] * position_size if greeks["gamma"] is not None else None,
-            "Vega": greeks["vega"] * position_size if greeks["vega"] is not None else None,
+            "Delta": greeks["delta"],
+            "Gamma": greeks["gamma"],
+            "Vega": greeks["vega"],
             "Theta": greeks["theta"],
             "Rho": greeks["rho"],
             "Price": greeks["price"]
@@ -473,11 +595,28 @@ def run_calculation():
     # 2. CALCUL BLACK-76
     b76_results = []
     for idx, row in st.session_state.positions.iterrows():
-        greeks = compute_b76_greeks_for_position(row, bloomberg_df, st.session_state.risk_free_rate)
-
         ticker = row.get('Ticker', '')
+
+        # Récupérer l'IV depuis Bloomberg en PREMIER
+        iv_bloomberg = None
+        underlying_price_bloomberg = None
+        if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
+            bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
+            iv_bloomberg = bbg_row.get('IV', None)
+            underlying_price_bloomberg = bbg_row.get('Underlying_Price', None)
+
+        # Créer une copie enrichie de row avec les données Bloomberg
+        row_enriched = row.copy()
+        if iv_bloomberg is not None and not pd.isna(iv_bloomberg):
+            row_enriched['IV_Bloomberg'] = iv_bloomberg
+        if underlying_price_bloomberg is not None:
+            row_enriched['Underlying_Price_Bloomberg'] = underlying_price_bloomberg
+
+        # Calculer les Greeks avec les données enrichies
+        greeks = compute_b76_greeks_for_position(row_enriched, bloomberg_df, st.session_state.risk_free_rate)
+
         position_size = row.get('Size', row.get('Position_Size', 0))
-        strike = row.get('Strike Px', row.get('Strike_Px', row.get('Strike', 0)))  # MODIFIÉ
+        strike = row.get('Strike Px', row.get('Strike_Px', row.get('Strike', 0)))
         settlement_price = row.get('Settlement Price', row.get('Settlement_Price', 0))
 
         # Récupérer les données de prix depuis Bloomberg
@@ -485,6 +624,7 @@ def run_calculation():
         ask = None
         last_price = None
         iv = None
+        underlying_price = None
 
         if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
             bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
@@ -492,6 +632,7 @@ def run_calculation():
             ask = bbg_row.get('Ask', None)
             last_price = bbg_row.get('Last_Price', None)
             iv = bbg_row.get('IV', None)
+            underlying_price = bbg_row.get('Underlying_Price', None)
 
         result = {
             'Product': ticker,
@@ -501,6 +642,7 @@ def run_calculation():
             'Bid': bid,
             'Ask': ask,
             'Last_Price': last_price,
+            'Underlying_Price': underlying_price,  # ← AJOUTE CETTE LIGNE
             'IV': iv,
             'Delta': greeks['Delta'],
             'Gamma': greeks['Gamma'],
@@ -798,9 +940,6 @@ if selected_tab == "Positions":
                 df_filtered = df_filtered[df_filtered['Maturity'].isin(maturities)]
 
         st.markdown("### Tableau des Positions")
-        st.dataframe(df_filtered, use_container_width=True, height=400)
-
-        st.markdown("### Modifier ou Supprimer une position")
         st.info(
             "Editez directement les valeurs dans le tableau ci-dessous. Les modifications seront sauvegardees automatiquement.")
 
