@@ -33,7 +33,27 @@ except ImportError:
     BLOOMBERG_AVAILABLE = False
     st.warning("⚠️ Bloomberg API non disponible. Installez blpapi: pip install blpapi")
 
+# Définition des tenors standard pour la courbe US Treasury
+TREASURY_TICKERS = {
+    '1M': 'USGG1M Index',    # 1 Month
+    '3M': 'USGG3M Index',    # 3 Month
+    '6M': 'USGG6M Index',    # 6 Month
+    '1Y': 'USGG1YR Index',   # 1 Year
+    '2Y': 'USGG2YR Index',   # 2 Year
+    '3Y': 'USGG3YR Index',   # 3 Year
+    '5Y': 'USGG5YR Index',   # 5 Year
+    '7Y': 'USGG7YR Index',   # 7 Year
+    '10Y': 'USGG10YR Index', # 10 Year
+    '20Y': 'USGG20YR Index', # 20 Year
+    '30Y': 'USGG30YR Index'  # 30 Year
+}
 
+# Conversion des tenors en années
+TENOR_TO_YEARS = {
+    '1M': 1/12, '3M': 3/12, '6M': 6/12,
+    '1Y': 1, '2Y': 2, '3Y': 3, '5Y': 5,
+    '7Y': 7, '10Y': 10, '20Y': 20, '30Y': 30
+}
 # ============================================================================
 # FONCTIONS BLOOMBERG
 # ============================================================================
@@ -209,7 +229,7 @@ def fetch_bloomberg_greeks(df):
             underlying_tickers.append(underlying)
         ticker_to_underlying[ticker] = underlying
 
-    with st.spinner(f"📡 Récupération des données Bloomberg pour {len(tickers)} positions..."):
+    with st.spinner(f" Récupération des données Bloomberg pour {len(tickers)} positions..."):
         try:
             # Récupérer les données des options
             bloomberg_data = get_bloomberg_data_batch(session, tickers, bloomberg_fields)
@@ -275,7 +295,7 @@ def fetch_bloomberg_greeks(df):
 
                 bbg_results.append(result)
 
-            st.success(f"✅ Données Bloomberg récupérées pour {len(tickers)} positions")
+            st.success(f" Données Bloomberg récupérées pour {len(tickers)} positions")
             return pd.DataFrame(bbg_results)
 
         except Exception as e:
@@ -283,6 +303,89 @@ def fetch_bloomberg_greeks(df):
             return pd.DataFrame()
         finally:
             session.stop()
+
+
+def fetch_bloomberg_rates_curve():
+    """
+    Récupère la courbe des taux US Treasury depuis Bloomberg
+    RETOURNE UN DATAFRAME avec les colonnes: Tenor, Maturity_Years, Ticker, Rate_%, Rate_Decimal
+    """
+    session = start_bloomberg_session()
+
+    if session is None:
+        st.warning("⚠️ Bloomberg non disponible - courbe de taux non récupérée")
+        return pd.DataFrame()
+
+    try:
+        with st.spinner(f" Récupération de la courbe US Treasury ({len(TREASURY_TICKERS)} tenors)..."):
+            # Récupération des taux via Bloomberg
+            tickers = list(TREASURY_TICKERS.values())
+            rate_data = get_bloomberg_data_batch(session, tickers, ['PX_LAST'])
+
+            # Construction du DataFrame de la courbe
+            curve_records = []
+            missing_count = 0
+
+            for tenor, ticker in TREASURY_TICKERS.items():
+                rate = rate_data.get(ticker, {}).get('PX_LAST')
+                years = TENOR_TO_YEARS[tenor]
+
+                if rate is not None and not pd.isna(rate):
+                    curve_records.append({
+                        'Tenor': tenor,
+                        'Maturity_Years': years,
+                        'Ticker': ticker,
+                        'Rate_%': rate,
+                        'Rate_Decimal': rate / 100.0
+                    })
+                    print(f"  ✓ {tenor:4} ({ticker:20}) : {rate:6.3f}%")
+                else:
+                    missing_count += 1
+                    print(f"  ⚠️ {tenor:4} ({ticker:20}) : N/A")
+
+            if curve_records:
+                rates_curve_df = pd.DataFrame(curve_records)
+                st.success(f" Courbe de taux récupérée: {len(curve_records)}/{len(TREASURY_TICKERS)} points")
+
+                if missing_count > 0:
+                    st.warning(f"⚠️ {missing_count} point(s) manquant(s)")
+
+                return rates_curve_df
+            else:
+                st.error("❌ Aucune donnée de taux récupérée")
+                return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"❌ Erreur lors de la récupération de la courbe: {str(e)}")
+        return pd.DataFrame()
+    finally:
+        session.stop()
+
+def get_rate_for_T(T: float) -> float:
+    """
+    Renvoie le taux sans risque (décimal) correspondant à la maturité T (en années)
+    en interpolant sur st.session_state.rates_data.
+    Fallback sur st.session_state.risk_free_rate si la courbe n'est pas dispo.
+    """
+    rates_df = st.session_state.get("rates_data", None)
+    if rates_df is None or rates_df.empty or T is None or T <= 0:
+        return st.session_state.risk_free_rate
+
+    # Vérifier la présence des colonnes
+    if not {"Maturity_Years", "Rate_Decimal"}.issubset(rates_df.columns):
+        return st.session_state.risk_free_rate
+
+    # Trier par maturité
+    df = rates_df.sort_values("Maturity_Years")
+
+    # Clip si T est hors de la courbe
+    if T <= df["Maturity_Years"].iloc[0]:
+        return float(df["Rate_Decimal"].iloc[0])
+    if T >= df["Maturity_Years"].iloc[-1]:
+        return float(df["Rate_Decimal"].iloc[-1])
+
+    # Interpolation linéaire
+    return float(np.interp(T, df["Maturity_Years"].values, df["Rate_Decimal"].values))
 
 
 def send_email_with_attachment(recipient_email, subject, body, excel_file_bytes, filename):
@@ -297,31 +400,38 @@ def send_email_with_attachment(recipient_email, subject, body, excel_file_bytes,
         return False, "❌ SendGrid non installé. Exécutez: pip install sendgrid"
 
     try:
-        # Configuration SendGrid
-        api_key = st.secrets.get("sendgrid", {}).get("API_KEY", "")
-        sender_email = st.secrets.get("sendgrid", {}).get("SENDER_EMAIL", "")
-        sender_name = st.secrets.get("sendgrid", {}).get("SENDER_NAME", "Risk Monitor")
-
-        # Debug : afficher la config (sans révéler la clé complète)
-        st.info(f"📋 Configuration:")
-        st.write(
-            f"- API Key: {'✅ Présente' if api_key else '❌ Manquante'} ({api_key[:10] + '...' if api_key else 'Aucune'})")
-        st.write(f"- Sender: {sender_email if sender_email else '❌ Manquant'}")
-        st.write(f"- Recipient: {recipient_email}")
-
-        if not api_key or not sender_email:
-            error_msg = "⚠️ Configuration SendGrid incomplète:\n"
-            if not api_key:
-                error_msg += "- API_KEY manquante\n"
-            if not sender_email:
-                error_msg += "- SENDER_EMAIL manquant\n"
-            error_msg += "\nAjoutez ces infos dans .streamlit/secrets.toml"
+        # Configuration SendGrid avec gestion d'erreur améliorée
+        try:
+            api_key = st.secrets["sendgrid"]["API_KEY"]
+            sender_email = st.secrets["sendgrid"]["SENDER_EMAIL"]
+            sender_name = st.secrets["sendgrid"].get("SENDER_NAME", "Risk Monitor")
+        except KeyError as e:
+            error_msg = f"❌ Configuration manquante dans secrets.toml: {str(e)}\n\n"
+            error_msg += "Ajoutez dans .streamlit/secrets.toml:\n\n"
+            error_msg += '[sendgrid]\n'
+            error_msg += 'API_KEY = "SG.votre_cle_ici"\n'
+            error_msg += 'SENDER_EMAIL = "votre.email@gmail.com"\n'
+            error_msg += 'SENDER_NAME = "Risk Monitor"'
             st.error(error_msg)
             return False, error_msg
 
-        st.info("📧 Création du message...")
+        # Validation des données
+        if not api_key or len(api_key) < 20:
+            return False, "❌ API Key SendGrid invalide ou trop courte"
+
+        if not sender_email or '@' not in sender_email:
+            return False, f"❌ Email expéditeur invalide: {sender_email}"
+
+        if not recipient_email or '@' not in recipient_email:
+            return False, f"❌ Email destinataire invalide: {recipient_email}"
+
+        st.info(f"📋 Configuration validée:")
+        st.write(f"- Sender: {sender_email}")
+        st.write(f"- Recipient: {recipient_email}")
+        st.write(f"- API Key: {api_key[:10]}...{api_key[-4:]}")
 
         # Créer le message
+        st.info("📧 Création du message...")
         message = Mail(
             from_email=(sender_email, sender_name),
             to_emails=recipient_email,
@@ -329,14 +439,11 @@ def send_email_with_attachment(recipient_email, subject, body, excel_file_bytes,
             html_content=body.replace('\n', '<br>')
         )
 
-        st.info(f"📎 Encodage du fichier ({len(excel_file_bytes)} bytes)...")
-
         # Encoder le fichier en base64
-        encoded_file = base64.b64encode(excel_file_bytes).decode()
+        st.info(f"📎 Encodage du fichier ({len(excel_file_bytes)} bytes)...")
+        encoded_file = base64.b64encode(excel_file_bytes).decode('utf-8')
 
-        st.info(f"📎 Fichier encodé: {len(encoded_file)} caractères")
-
-        # Créer l'attachement
+        # Créer l'attachement avec les bons paramètres
         attached_file = Attachment(
             FileContent(encoded_file),
             FileName(filename),
@@ -345,41 +452,47 @@ def send_email_with_attachment(recipient_email, subject, body, excel_file_bytes,
         )
         message.attachment = attached_file
 
-        st.info("🚀 Envoi via SendGrid...")
-
         # Envoyer l'email
+        st.info("🚀 Envoi via SendGrid...")
         sg = SendGridAPIClient(api_key)
-        response = sg.send(message)
+
+        # Ajouter un timeout et une meilleure gestion d'erreur
+        try:
+            response = sg.send(message)
+        except Exception as send_error:
+            error_detail = str(send_error)
+
+            # Erreurs spécifiques SendGrid
+            if "401" in error_detail or "Unauthorized" in error_detail:
+                return False, "❌ Clé API invalide. Vérifiez votre clé sur https://app.sendgrid.com/settings/api_keys"
+            elif "403" in error_detail or "Forbidden" in error_detail:
+                return False, "❌ Accès refusé. Vérifiez que l'email expéditeur est vérifié dans SendGrid"
+            elif "400" in error_detail:
+                return False, f"❌ Requête invalide: {error_detail}"
+            else:
+                return False, f"❌ Erreur d'envoi: {error_detail}"
 
         st.info(f"📬 Réponse SendGrid: Code {response.status_code}")
 
+        # Vérifier le succès
         if response.status_code in [200, 201, 202]:
-            success_msg = f"✅ Email envoyé avec succès à {recipient_email}!\n\nCode: {response.status_code}\nVérifiez votre boîte de réception (et les spams)"
+            success_msg = f"✅ Email envoyé avec succès à {recipient_email}!\n\n"
+            success_msg += f"Code: {response.status_code}\n"
+            success_msg += "Vérifiez votre boîte de réception (et les spams)"
             return True, success_msg
         else:
-            return False, f"❌ Erreur SendGrid (Code {response.status_code})\nHeaders: {response.headers}"
+            return False, f"❌ Erreur SendGrid (Code {response.status_code})"
 
     except Exception as e:
-        error_msg = str(e)
-        st.error(f"💥 Exception: {error_msg}")
+        error_msg = f"💥 Exception inattendue: {str(e)}\n\n"
+        error_msg += f"Type: {type(e).__name__}"
 
-        # Messages d'erreur spécifiques
-        if "401" in error_msg or "Unauthorized" in error_msg:
-            detailed_error = "❌ Clé API SendGrid invalide\n\nVérifiez:\n1. La clé dans secrets.toml est complète\n2. La clé n'a pas expiré\n3. Créez une nouvelle clé sur https://app.sendgrid.com/settings/api_keys"
-            st.error(detailed_error)
-            return False, detailed_error
-        elif "403" in error_msg or "Forbidden" in error_msg:
-            detailed_error = "❌ Accès refusé par SendGrid\n\nPossibles causes:\n1. Email expéditeur non vérifié\n2. Compte SendGrid suspendu\n3. Permissions API insuffisantes"
-            st.error(detailed_error)
-            return False, detailed_error
-        elif "The from email does not contain a valid address" in error_msg:
-            detailed_error = f"❌ Email expéditeur invalide: {sender_email}\n\nVérifiez SENDER_EMAIL dans secrets.toml"
-            st.error(detailed_error)
-            return False, detailed_error
-        else:
-            detailed_error = f"❌ Erreur SendGrid:\n{error_msg}\n\nType: {type(e).__name__}"
-            st.error(detailed_error)
-            return False, detailed_error
+        import traceback
+        st.error(error_msg)
+        st.code(traceback.format_exc())
+
+        return False, error_msg
+
 
 # ============================================================================
 # FONCTIONS DE CALCUL DES GREEKS (Black-76 et Bachelier)
@@ -415,11 +528,11 @@ def black76_greeks(F: float, K: float, T: float, r: float, sigma: float, option_
         rho = -T * df * (F * Nd1 - K * Nd2)
     else:  # PUT
         delta = df * (Nd1 - 1.0)
-        theta = -(F * nd1 * sigma * df) / (2 * sqrtT) + r * df * (K * norm_cdf(-d2) - F * norm_cdf(-d1))
+        theta = (-(F * nd1 * sigma * df) / (2 * sqrtT) + r * df * (K * norm_cdf(-d2) - F * norm_cdf(-d1)))
         rho = -T * df * (K * norm_cdf(-d2) - F * norm_cdf(-d1))
 
     gamma = df * nd1 / (F * sigma * sqrtT)
-    vega = df * F * nd1 * sqrtT
+    vega = df * F * nd1 * sqrtT * 0.01
 
     return {"delta": delta, "gamma": gamma, "vega": vega, "theta": theta, "rho": rho}
 
@@ -450,7 +563,7 @@ def bachelier_greeks(F: float, K: float, T: float, r: float, sigma: float, optio
         price = df * ((K - F) * norm_cdf(-d) + sigma_normal * sqrtT * nd)
         delta = df * (Nd - 1.0)
         # Theta pour Put
-        theta = (-sigma_normal * nd * df) / (2 * sqrtT) - r * price
+        theta = ((-sigma_normal * nd * df) / (2 * sqrtT) - r * price)
         # Rho pour Put
         rho = -T * price
 
@@ -575,8 +688,8 @@ def heston_greeks(F, K, T, r, v0, kappa, theta, sigma, rho, lambd, option_type):
     return {
         "delta": delta,
         "gamma": gamma,
-        "vega": vega,
-        "theta": theta,
+        "vega": vega * 0.01,
+        "theta": theta * 0.01,
         "rho": rho_greek,
         "price": price
     }
@@ -584,6 +697,9 @@ def heston_greeks(F, K, T, r, v0, kappa, theta, sigma, rho, lambd, option_type):
 # ============================================================================
 def safe_time_to_maturity(maturity_value, today: date) -> float:
     """Convertit la maturité en T (années)."""
+    # Sécuriser le type de `today` au cas où une variable float globale l'écrase
+    if isinstance(today, (int, float)):
+        today = datetime.today().date()
 
     # Si c'est déjà un datetime/Timestamp
     if isinstance(maturity_value, (datetime, pd.Timestamp)):
@@ -635,7 +751,7 @@ def safe_time_to_maturity(maturity_value, today: date) -> float:
     return T
 
 
-def compute_b76_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05, valuation_date=None):
+def compute_b76_greeks_for_position(row, bloomberg_df, valuation_date=None):
     """Calcule les Greeks Black-76 pour une position"""
     ticker = row.get('Ticker', 'Unknown')
 
@@ -651,44 +767,42 @@ def compute_b76_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05, valu
         # CHECK 2 : Calcul de T
         T = safe_time_to_maturity(row["Maturity"], valuation_date)
 
-        # CHECK 3 : F (prix du FUTURE, pas de l'option) et K
-        K = row.get("Strike", row.get("Strike_Px", row.get("Strike Px", 0)))
+        # Taux sans risque en fonction de T (fallback sur risk_free_rate global)
+        if st.session_state.get("rates_data") is not None:
+            r_local = get_rate_for_T(T)
+        else:
+            r_local = st.session_state.risk_free_rate
 
-        # ⚠️ MODIFICATION CRITIQUE : Récupérer le prix du future depuis Bloomberg
+        # CHECK 3 : F et K
+        K = row.get("Strike", row.get("Strike_Px", row.get("Strike Px", 0)))
         F = None
         if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
             bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
             F = bbg_row.get('Underlying_Price', None)
 
-        # Si pas de prix du future Bloomberg, utiliser une valeur par défaut ou depuis Excel
         if F is None or pd.isna(F):
-            # Option : chercher dans une colonne Excel "Underlying_Price" ou "Future_Price"
             F = row.get("Underlying_Price", row.get("Future_Price", None))
-
-        # Si toujours pas de prix, utiliser Strike comme approximation (mauvaise pratique mais mieux que 0)
         if F is None or F == 0:
             print(f"⚠️ {ticker} : Pas de prix du future disponible, utilisation du Strike comme approximation")
-            F = K  # Approximation : ATM
+            F = K
 
         print(f"\n🔍 {ticker} - Maturity = {row['Maturity']}, T = {T:.4f} ans")
         print(f"   F (Underlying Future) = {F}")
         print(f"   K (Strike) = {K}")
+        print(f"   r_local (US curve) = {r_local:.4f}")
 
         if F == 0 or K == 0:
             print(f"❌ {ticker} : F={F} ou K={K} = 0 → Greeks = None")
             return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None}
 
-        # CHECK 4 : IV - PRIORITÉ À L'IV enrichie
-        iv = row.get('IV_Bloomberg', None)  # ← CHERCHER EN PREMIER l'IV enrichie
+        # CHECK 4 : IV
+        iv = row.get('IV_Bloomberg', None)
         print(f"   IV Bloomberg (enrichie) = {iv}")
-
         if iv is None or pd.isna(iv):
-            # Fallback : chercher dans bloomberg_df
             if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
                 bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
                 iv = bbg_row.get('IV', None)
                 print(f"   IV Bloomberg (df) = {iv}")
-
         if iv is None or pd.isna(iv):
             iv = row.get("IV")
             print(f"   IV from row = {iv}")
@@ -700,17 +814,17 @@ def compute_b76_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05, valu
             sigma = float(iv) / 100.0
             print(f"   ✅ σ (sigma) = {sigma}")
 
-        # CHECK 5 : Option Type et Position Size
-        option_type = row.get("Type", row.get("Put_Call", "C"))
+        # CHECK 5 : Type
+        raw_type = str(row.get("Put/Call", row.get("Put_Call", row.get("Type", "C")))).strip().upper()
+        option_type = "P" if raw_type.startswith("P") else "C"
         position_size = row.get("Size", row.get("Position_Size", 1))
         print(f"   Type = {option_type}, Size = {position_size}")
 
-        # CHECK 6 : Appel à black76_greeks
-        print(f"   📞 Appel black76_greeks(F={F}, K={K}, T={T:.4f}, r={risk_free_rate}, σ={sigma}, type={option_type})")
+        print(f"   📞 Appel black76_greeks(F={F}, K={K}, T={T:.4f}, r={r_local}, σ={sigma}, type={option_type})")
 
         greeks = black76_greeks(
             F=float(F), K=float(K), T=float(T),
-            r=float(risk_free_rate), sigma=float(sigma),
+            r=float(r_local), sigma=float(sigma),
             option_type=option_type
         )
 
@@ -730,7 +844,8 @@ def compute_b76_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05, valu
         return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None}
 
 
-def compute_bachelier_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05, valuation_date=None):
+
+def compute_bachelier_greeks_for_position(row, bloomberg_df, valuation_date=None):
     """Calcule les Greeks Bachelier pour une position"""
     if valuation_date is None:
         valuation_date = datetime.today().date()
@@ -740,30 +855,31 @@ def compute_bachelier_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05
             return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
 
         T = safe_time_to_maturity(row["Maturity"], valuation_date)
+
+        # r(T) avec fallback global
+        if st.session_state.get("rates_data") is not None:
+            r_local = get_rate_for_T(T)
+        else:
+            r_local = st.session_state.risk_free_rate
+
         K = row.get("Strike", row.get("Strike_Px", row.get("Strike Px", 0)))
 
-        # ⚠️ MODIFICATION : Récupérer le prix du future depuis Bloomberg (comme pour B76)
         ticker = row.get('Ticker', '')
         F = None
         if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
             bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
             F = bbg_row.get('Underlying_Price', None)
 
-        # Si pas de prix du future Bloomberg, utiliser une valeur par défaut
         if F is None or pd.isna(F) or F == 0:
-            F = K  # Approximation : ATM
+            F = K
 
         if K == 0:
             return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
 
-        # Récupérer l'IV depuis Bloomberg si disponible
-        ticker = row.get('Ticker', '')
         iv = None
         if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
             bbg_row = bloomberg_df[bloomberg_df['Product'] == ticker].iloc[0]
             iv = bbg_row.get('IV', None)
-
-        # Si pas d'IV Bloomberg, utiliser la colonne du tableau original
         if iv is None or pd.isna(iv):
             iv = row.get("IV")
 
@@ -772,13 +888,12 @@ def compute_bachelier_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05
         else:
             sigma = float(iv) / 100.0
 
-        option_type = row.get("Type", row.get("Put_Call", "C"))
-        # Utiliser 'Size' au lieu de 'Position_Size'
-        position_size = row.get("Size", row.get("Position_Size", 1))
+        raw_type = str(row.get("Put/Call", row.get("Put_Call", row.get("Type", "C")))).strip().upper()
+        option_type = "P" if raw_type.startswith("P") else "C"
 
         greeks = bachelier_greeks(
             F=float(F), K=float(K), T=float(T),
-            r=float(risk_free_rate), sigma=float(sigma),
+            r=float(r_local), sigma=float(sigma),
             option_type=option_type
         )
 
@@ -795,7 +910,8 @@ def compute_bachelier_greeks_for_position(row, bloomberg_df, risk_free_rate=0.05
         return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
 
 
-def compute_heston_greeks_for_position(row, bloomberg_df, heston_params, risk_free_rate=0.05, valuation_date=None):
+
+def compute_heston_greeks_for_position(row, bloomberg_df, heston_params, valuation_date=None):
     """Calcule les Greeks Heston pour une position"""
     if valuation_date is None:
         valuation_date = datetime.today().date()
@@ -805,9 +921,15 @@ def compute_heston_greeks_for_position(row, bloomberg_df, heston_params, risk_fr
             return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
 
         T = safe_time_to_maturity(row["Maturity"], valuation_date)
+
+        # r(T) avec fallback global
+        if st.session_state.get("rates_data") is not None:
+            r_local = get_rate_for_T(T)
+        else:
+            r_local = st.session_state.risk_free_rate
+
         K = row.get("Strike", row.get("Strike_Px", row.get("Strike Px", 0)))
 
-        # Récupérer le prix du future depuis Bloomberg
         ticker = row.get('Ticker', '')
         F = None
         if not bloomberg_df.empty and ticker in bloomberg_df['Product'].values:
@@ -820,11 +942,11 @@ def compute_heston_greeks_for_position(row, bloomberg_df, heston_params, risk_fr
         if K == 0:
             return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
 
-        option_type = row.get("Type", row.get("Put_Call", "C"))
+        raw_type = str(row.get("Put/Call", row.get("Put_Call", row.get("Type", "C")))).strip().upper()
+        option_type = "P" if raw_type.startswith("P") else "C"
 
-        # Utiliser les paramètres Heston calibrés
         greeks = heston_greeks(
-            F=float(F), K=float(K), T=float(T), r=float(risk_free_rate),
+            F=float(F), K=float(K), T=float(T), r=float(r_local),
             v0=heston_params['v0'],
             kappa=heston_params['kappa'],
             theta=heston_params['theta'],
@@ -845,6 +967,8 @@ def compute_heston_greeks_for_position(row, bloomberg_df, heston_params, risk_fr
     except Exception as e:
         print(f"Erreur calcul Heston: {e}")
         return {"Delta": None, "Gamma": None, "Vega": None, "Theta": None, "Rho": None, "Price": None}
+
+
 
 # ============================================================================
 # CONFIGURATION STREAMLIT
@@ -897,7 +1021,7 @@ if 'heston_params' not in st.session_state:
 # ============================================================================
 
 def run_calculation():
-    """Calcule les Greeks pour toutes les positions"""
+    """Calcule les Greeks pour toutes les positions et récupère la courbe des taux"""
     if st.session_state.positions.empty:
         st.warning("Aucune position à calculer")
         return
@@ -905,6 +1029,34 @@ def run_calculation():
     # 1. RÉCUPÉRATION DES DONNÉES BLOOMBERG (sans modifier positions)
     bloomberg_df = fetch_bloomberg_greeks(st.session_state.positions)
     st.session_state.bloomberg_greeks = bloomberg_df
+
+    # 1.5 RÉCUPÉRATION DE LA COURBE DES TAUX US TREASURY
+    st.markdown("###  Récupération de la courbe des taux")
+    rates_df = fetch_bloomberg_rates_curve()
+    if not rates_df.empty:
+        st.session_state.rates_data = rates_df
+
+        # Afficher un aperçu de la courbe
+        col1, col2, col3, col4 = st.columns(4)
+        try:
+            with col1:
+                rate_3m = rates_df[rates_df['Tenor'] == '3M']['Rate_%'].values[0]
+                st.metric("3M", f"{rate_3m:.3f}%")
+            with col2:
+                rate_2y = rates_df[rates_df['Tenor'] == '2Y']['Rate_%'].values[0]
+                st.metric("2Y", f"{rate_2y:.3f}%")
+            with col3:
+                rate_10y = rates_df[rates_df['Tenor'] == '10Y']['Rate_%'].values[0]
+                st.metric("10Y", f"{rate_10y:.3f}%")
+            with col4:
+                rate_30y = rates_df[rates_df['Tenor'] == '30Y']['Rate_%'].values[0]
+                st.metric("30Y", f"{rate_30y:.3f}%")
+        except:
+            pass
+    else:
+        st.session_state.rates_data = None
+
+    st.markdown("---")
 
     # 2. CALCUL BLACK-76
     b76_results = []
@@ -1083,55 +1235,35 @@ with st.sidebar:
 
     st.markdown("### Bloomberg Status")
     if BLOOMBERG_AVAILABLE:
-        st.success("✅ Bloomberg API installée")
+        st.success(" Bloomberg API installée")
     else:
         st.error("❌ Bloomberg API non disponible")
         st.code("pip install blpapi", language="bash")
 
-    # ← AJOUT: Statut SendGrid
-    st.markdown("### SendGrid Status")
-    if SENDGRID_AVAILABLE:
-        api_key = st.secrets.get("sendgrid", {}).get("API_KEY", "")
-        if api_key:
-            st.success("✅ SendGrid configuré")
-        else:
-            st.warning("⚠️ SendGrid installé mais non configuré")
-            with st.expander("Configuration requise"):
-                st.code("""[sendgrid]
-API_KEY = "votre_cle_api"
-SENDER_EMAIL = "votre.email@gmail.com"
-SENDER_NAME = "Risk Monitor" """)
-    else:
-        st.error("❌ SendGrid non installé")
-        st.code("pip install sendgrid", language="bash")
 
-    mode = st.radio(
-        "Mode de travail",
-        ["Saisie manuelle", "Import Excel"]
-    )
+    st.markdown("### Import de données")
 
-    if mode == "Import Excel":
-        uploaded_file = st.file_uploader("Charger le fichier Excel", type=['xlsx', 'xls'])
+    uploaded_file = st.file_uploader("Charger le fichier Excel", type=['xlsx', 'xls'])
 
-        if uploaded_file:
-            try:
-                xls = pd.ExcelFile(uploaded_file)
-                selected_sheet = st.selectbox("Selectionner l'onglet", xls.sheet_names)
+    if uploaded_file:
+        try:
+            xls = pd.ExcelFile(uploaded_file)
+            selected_sheet = st.selectbox("Selectionner l'onglet", xls.sheet_names)
 
-                if st.button("Importer les donnees"):
-                    st.session_state.positions = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
+            if st.button("Importer les donnees"):
+                st.session_state.positions = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
 
-                    if 'B76_Greeks' in xls.sheet_names:
-                        st.session_state.b76_greeks = pd.read_excel(uploaded_file, sheet_name='B76_Greeks')
-                    if 'Bachelier_Greeks' in xls.sheet_names:
-                        st.session_state.bachelier_greeks = pd.read_excel(uploaded_file, sheet_name='Bachelier_Greeks')
-                    if 'US_Rates_Curve' in xls.sheet_names:
-                        st.session_state.rates_data = pd.read_excel(uploaded_file, sheet_name='US_Rates_Curve')
+                if 'B76_Greeks' in xls.sheet_names:
+                    st.session_state.b76_greeks = pd.read_excel(uploaded_file, sheet_name='B76_Greeks')
+                if 'Bachelier_Greeks' in xls.sheet_names:
+                    st.session_state.bachelier_greeks = pd.read_excel(uploaded_file, sheet_name='Bachelier_Greeks')
+                if 'US_Rates_Curve' in xls.sheet_names:
+                    st.session_state.rates_data = pd.read_excel(uploaded_file, sheet_name='US_Rates_Curve')
 
-                    st.success("Donnees importees avec succes")
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Erreur lors de l'import : {e}")
+                st.success("Donnees importees avec succes")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Erreur lors de l'import : {e}")
 
     st.markdown("---")
 
@@ -1155,7 +1287,7 @@ SENDER_NAME = "Risk Monitor" """)
         export_col1, export_col2, export_col3 = st.columns(3)
 
         with export_col1:
-            if st.button("📊 Excel", use_container_width=True):
+            if st.button(" Excel", use_container_width=True):
                 output_file = f"risk_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                 with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
                     st.session_state.positions.to_excel(writer, sheet_name='Positions', index=False)
@@ -1204,7 +1336,7 @@ SENDER_NAME = "Risk Monitor" """)
         with export_col2:
             csv = st.session_state.positions.to_csv(index=False).encode('utf-8')
             st.download_button(
-                label="📄 CSV",
+                label=" CSV",
                 data=csv,
                 file_name=f"positions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
@@ -1212,13 +1344,13 @@ SENDER_NAME = "Risk Monitor" """)
             )
 
         with export_col3:
-            if st.button("📧 Email", use_container_width=True):
+            if st.button(" Email", use_container_width=True):
                 st.session_state.show_email_form = True
 
         # Formulaire d'envoi d'email (apparaît sous les boutons)
         if st.session_state.get('show_email_form', False):
             st.markdown("---")
-            st.markdown("##### 📧 Envoyer par Email")
+            st.markdown("#####  Envoyer par Email")
 
             with st.form("email_form"):
                 recipient = st.text_input(
@@ -1298,7 +1430,7 @@ Risk Monitor System""",
                         excel_data = output.getvalue()
                         filename = f"risk_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
-                        with st.spinner("📤 Envoi en cours..."):
+                        with st.spinner(" Envoi en cours..."):
                             success, message = send_email_with_attachment(
                                 recipient,
                                 email_subject,
@@ -1318,49 +1450,6 @@ Risk Monitor System""",
                 st.session_state.show_email_form = False
                 st.rerun()
 
-    st.markdown("---")
-    st.subheader("🔍 Diagnostic Réseau")
-
-    if st.button("Tester les ports SMTP", use_container_width=True):
-        results = []
-
-        # Test port 587
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            result = sock.connect_ex(('smtp.gmail.com', 587))
-            sock.close()
-            if result == 0:
-                results.append(("success", "✅ Port 587 (TLS): Accessible"))
-            else:
-                results.append(("error", "❌ Port 587 (TLS): Bloqué"))
-        except Exception as e:
-            results.append(("error", "❌ Port 587: Bloqué"))
-
-        # Test port 465
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            result = sock.connect_ex(('smtp.gmail.com', 465))
-            sock.close()
-            if result == 0:
-                results.append(("success", "✅ Port 465 (SSL): Accessible"))
-            else:
-                results.append(("error", "❌ Port 465 (SSL): Bloqué"))
-        except Exception as e:
-            results.append(("error", "❌ Port 465: Bloqué"))
-
-        # Afficher les résultats
-        for status, msg in results:
-            if status == "success":
-                st.success(msg)
-            else:
-                st.error(msg)
-
-        # Recommandations
-        accessible_ports = [r for r in results if r[0] == "success"]
-        if not accessible_ports:
-            st.warning("⚠️ Ports SMTP bloqués → Utilisez SendGrid")
 
 # ============================================================================
 # AFFICHAGE PRINCIPAL
@@ -1387,26 +1476,32 @@ if not df.empty:
             )
 
     with col3:
-        if not st.session_state.b76_greeks.empty and 'Delta' in st.session_state.b76_greeks.columns:
-            total_delta = st.session_state.b76_greeks['Delta'].dropna().sum()
+        if not st.session_state.b76_greeks.empty and {'Delta', 'Position_Size'}.issubset(st.session_state.b76_greeks.columns):
+            df_b76 = st.session_state.b76_greeks.copy()
+            df_b76['Delta'] = df_b76['Delta'] * df_b76['Position_Size']
+            total_delta = df_b76['Delta'].dropna().sum()
+
             st.metric(
                 label="Delta Total (B76)",
                 value=f"{total_delta:.2f}",
                 delta=f"{total_delta:.2f}" if total_delta != 0 else None
             )
         else:
-            st.metric(label="Delta Total", value="0.00")
+            st.metric(label="Delta Total (B76)", value="0.00")
 
     with col4:
-        if not st.session_state.b76_greeks.empty and 'Gamma' in st.session_state.b76_greeks.columns:
-            total_gamma = st.session_state.b76_greeks['Gamma'].dropna().sum()
+        if not st.session_state.b76_greeks.empty and {'Gamma', 'Position_Size'}.issubset(st.session_state.b76_greeks.columns):
+            df_b76 = st.session_state.b76_greeks.copy()
+            df_b76['Gamma'] = df_b76['Gamma'] * df_b76['Position_Size']
+            total_gamma = df_b76['Gamma'].dropna().sum()
+
             st.metric(
                 label="Gamma Total (B76)",
                 value=f"{total_gamma:.4f}",
                 delta=f"{total_gamma:.4f}" if total_gamma != 0 else None
             )
         else:
-            st.metric(label="Gamma Total", value="0.00")
+            st.metric(label="Gamma Total (B76)", value="0.0000")
 
     with col5:
         if not st.session_state.b76_greeks.empty and 'PnL' in st.session_state.b76_greeks.columns:
@@ -1424,65 +1519,13 @@ if not df.empty:
 
 # Tabs pour différentes vues
 if st.session_state.show_positions:
-    if mode == "Saisie manuelle":
-        selected_tab = st.radio("Navigation",
-                                ["Nouvelle Position", "Positions", "Greeks", "Courbe des Taux", "Analyse"],
-                                index=1, horizontal=True, label_visibility="collapsed")
-    else:
-        selected_tab = st.radio("Navigation", ["Positions", "Greeks", "Courbe des Taux", "Analyse"],
-                                index=0, horizontal=True, label_visibility="collapsed")
+    selected_tab = st.radio("Navigation", ["Positions", "Greeks", "Courbe des Taux", "Analyse"],
+                            index=1, horizontal=True, label_visibility="collapsed")
     st.session_state.show_positions = False
 else:
-    if mode == "Saisie manuelle":
-        selected_tab = st.radio("Navigation",
-                                ["Nouvelle Position", "Positions", "Greeks", "Courbe des Taux", "Analyse"],
-                                index=0, horizontal=True, label_visibility="collapsed")
-    else:
-        selected_tab = st.radio("Navigation", ["Positions", "Greeks", "Courbe des Taux", "Analyse"],
-                                index=0, horizontal=True, label_visibility="collapsed")
+    selected_tab = st.radio("Navigation", ["Positions", "Greeks", "Courbe des Taux", "Analyse"],
+                            index=0, horizontal=True, label_visibility="collapsed")
 
-if mode == "Saisie manuelle" and selected_tab == "Nouvelle Position":
-    st.subheader("Ajouter une nouvelle position")
-
-    with st.form("new_position_form"):
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            ticker = st.text_input("Ticker", value="CLG6C")
-            strike = st.number_input("Strike", value=58.0, step=0.5)
-
-        with col2:
-            position_size = st.number_input("Size", value=10, step=1)
-            maturity = st.text_input("Maturity", value="FEB 26")
-
-        with col3:
-            settlement_price = st.number_input("Settlement Price", value=0.0, step=0.01)
-            contract_size = st.number_input("Contract Size", value=1000, step=100)
-
-        with col4:
-            option_type = st.selectbox("Type", ["C", "P"])
-
-        submitted = st.form_submit_button("Ajouter la position", use_container_width=True)
-
-        if submitted:
-            new_row = {
-                'Ticker': ticker,
-                'Strike': strike,
-                'Size': position_size,
-                'Maturity': maturity,
-                'Settlement_Price': settlement_price,
-                'Contract_Size': contract_size,
-                'Type': option_type
-            }
-
-            st.session_state.positions = pd.concat([
-                st.session_state.positions,
-                pd.DataFrame([new_row])
-            ], ignore_index=True)
-
-            save_data()
-            st.success("Position ajoutee ! Cliquez sur Actualiser pour calculer les Greeks.")
-            st.rerun()
 
 if selected_tab == "Positions":
     st.subheader("Positions actuelles")
@@ -1598,6 +1641,123 @@ if selected_tab == "Greeks":
     else:
         st.info("Aucune donnee Bloomberg. Cliquez sur 'Calculer les risques' pour calculer.")
 
+    # Vue agrégée Bloomberg : bar chart à gauche, heatmap à droite
+    st.markdown("#### Vue agrégée Bloomberg Greeks")
+
+    col_left_bbg, col_right_bbg = st.columns(2)
+
+    with col_left_bbg:
+        st.markdown("##### Greeks par produit")
+
+        if not st.session_state.bloomberg_greeks.empty:
+            df_bbg = st.session_state.bloomberg_greeks.copy()
+
+            # Greeks pondérés par la taille de position
+            df_bbg["Delta_w"] = df_bbg["Delta"] * df_bbg["Position_Size"]
+            df_bbg["Gamma_w"] = df_bbg["Gamma"] * df_bbg["Position_Size"]
+            df_bbg["Vega_w"] = df_bbg["Vega"] * df_bbg["Position_Size"]
+
+            agg_bbg = (
+                df_bbg
+                .groupby("Product")[["Delta_w", "Gamma_w", "Vega_w"]]
+                .sum()
+                .reset_index()
+            )
+
+            fig_bbg_bar = px.bar(
+                agg_bbg,
+                x="Product",
+                y=["Delta_w", "Gamma_w", "Vega_w"],
+                barmode="group",
+                title="Greeks agrégés par produit "
+            )
+            fig_bbg_bar.update_layout(
+                plot_bgcolor="#242833",
+                paper_bgcolor="#242833",
+                font=dict(color="white"),
+                xaxis_title="Produit",
+                yaxis_title="Valeur agrégée",
+                legend_title="Greek"
+            )
+            st.plotly_chart(fig_bbg_bar, use_container_width=True)
+        else:
+            st.info("Aucune donnée Bloomberg pour le graphique agrégé.")
+
+    with col_right_bbg:
+        st.markdown("##### Greeks agrégés par maturité (Bloomberg)")
+
+        if not st.session_state.bloomberg_greeks.empty and not st.session_state.positions.empty:
+            df_bbg = st.session_state.bloomberg_greeks.copy()
+            df_pos = st.session_state.positions.copy()
+
+            from datetime import date
+
+            valuation_date = date.today()
+
+
+            def _compute_T(row):
+                try:
+                    return safe_time_to_maturity(row["Maturity"], valuation_date)
+                except Exception:
+                    return None
+
+
+            if "Maturity" in df_pos.columns:
+                # Calcul de T pour chaque ligne de positions
+                df_pos["T_years"] = df_pos.apply(_compute_T, axis=1)
+
+                # Merge T avec les greeks Bloomberg via le ticker
+                df_pos_t = df_pos[["Ticker", "T_years"]].rename(
+                    columns={"Ticker": "Product"}
+                )
+                df_bbg = df_bbg.merge(df_pos_t, on="Product", how="left")
+
+                # Choix du Greek à afficher (logiquement ici)
+                greek_choice = st.selectbox(
+                    "Greek à afficher par maturité",
+                    ["Delta", "Gamma", "Vega"],
+                    index=2,
+                    key="bbg_greek_by_T"
+                )
+
+                # Greek pondéré par la taille de position
+                df_bbg["Greek_w"] = df_bbg[greek_choice] * df_bbg["Position_Size"]
+
+                # Bucket de maturité pour lisibilité
+                df_bbg["T_bucket"] = df_bbg["T_years"].round(2)
+
+                agg_T = (
+                    df_bbg
+                    .dropna(subset=["T_bucket"])
+                    .groupby("T_bucket")["Greek_w"]
+                    .sum()
+                    .reset_index()
+                    .sort_values("T_bucket")
+                )
+
+                fig_T = px.bar(
+                    agg_T,
+                    x="T_bucket",
+                    y="Greek_w",
+                    title=f"{greek_choice} agrégé par maturité "
+                )
+                fig_T.update_layout(
+                    plot_bgcolor="#242833",
+                    paper_bgcolor="#242833",
+                    font=dict(color="white"),
+                    xaxis_title="Time to maturity (années)",
+                    yaxis_title=f"{greek_choice} agrégé"
+                )
+                st.plotly_chart(fig_T, use_container_width=True)
+
+                # Petit texte sous le graphique pour rappeler le choix
+                st.caption("Greek sélectionné : " + greek_choice)
+            else:
+                st.info("La colonne 'Maturity' n'est pas présente dans st.session_state.positions.")
+        else:
+            st.info("Aucune donnée Bloomberg / positions pour ce graphique.")
+
+
     st.markdown("---")
 
     st.markdown("### Black-76 Model")
@@ -1638,6 +1798,120 @@ if selected_tab == "Greeks":
     else:
         st.info("Aucune donnee B76. Cliquez sur 'Actualiser avec Bloomberg' pour calculer.")
 
+    st.markdown("### Vue agrégée des Greeks")
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown("#### Greeks par produit (B76)")
+
+        if not st.session_state.b76_greeks.empty:
+            df_b76 = st.session_state.b76_greeks.copy()
+            # Greeks pondérés par la taille de position
+            df_b76["Delta_w"] = df_b76["Delta"] * df_b76["Position_Size"]
+            df_b76["Gamma_w"] = df_b76["Gamma"] * df_b76["Position_Size"]
+            df_b76["Vega_w"] = df_b76["Vega"] * df_b76["Position_Size"]
+
+            agg_b76 = (
+                df_b76
+                .groupby("Product")[["Delta_w", "Gamma_w", "Vega_w"]]
+                .sum()
+                .reset_index()
+            )
+
+            fig_bars = px.bar(
+                agg_b76,
+                x="Product",
+                y=["Delta_w", "Gamma_w", "Vega_w"],
+                barmode="group",
+                title="Greeks agrégés par produit (B76)"
+            )
+            fig_bars.update_layout(
+                plot_bgcolor="#242833",
+                paper_bgcolor="#242833",
+                font=dict(color="white"),
+                xaxis_title="Produit",
+                yaxis_title="Valeur agrégée",
+                legend_title="Greek"
+            )
+            st.plotly_chart(fig_bars, use_container_width=True)
+        else:
+            st.info("Aucun Greek B76 disponible pour le graphique.")
+
+    with col_right:
+        st.markdown("#### Greeks agrégés par maturité (B76)")
+
+        if not st.session_state.b76_greeks.empty and not st.session_state.positions.empty:
+            df_b76 = st.session_state.b76_greeks.copy()
+            df_pos = st.session_state.positions.copy()
+
+            from datetime import date
+
+            valuation_date = date.today()
+
+
+            def _compute_T(row):
+                try:
+                    return safe_time_to_maturity(row["Maturity"], valuation_date)
+                except Exception:
+                    return None
+
+
+            if "Maturity" in df_pos.columns:
+                # Calcul de T pour chaque ligne de positions
+                df_pos["T_years"] = df_pos.apply(_compute_T, axis=1)
+
+                # Merge T avec les greeks B76 via le ticker
+                df_pos_t = df_pos[["Ticker", "T_years"]].rename(
+                    columns={"Ticker": "Product"}
+                )
+                df_b76 = df_b76.merge(df_pos_t, on="Product", how="left")
+
+                # Choix du Greek à afficher (sélecteur sous le graphe mais logique ici)
+                greek_choice_b76 = st.selectbox(
+                    "Greek à afficher par maturité (B76)",
+                    ["Delta", "Gamma", "Vega"],
+                    index=2,
+                    key="b76_greek_by_T"
+                )
+
+                # Greek pondéré par la taille de position
+                df_b76["Greek_w"] = df_b76[greek_choice_b76] * df_b76["Position_Size"]
+
+                # Bucket de maturité pour lisibilité
+                df_b76["T_bucket"] = df_b76["T_years"].round(2)
+
+                agg_T_b76 = (
+                    df_b76
+                    .dropna(subset=["T_bucket"])
+                    .groupby("T_bucket")["Greek_w"]
+                    .sum()
+                    .reset_index()
+                    .sort_values("T_bucket")
+                )
+
+                fig_T_b76 = px.bar(
+                    agg_T_b76,
+                    x="T_bucket",
+                    y="Greek_w",
+                    title=f"{greek_choice_b76} agrégé par maturité (B76)"
+                )
+                fig_T_b76.update_layout(
+                    plot_bgcolor="#242833",
+                    paper_bgcolor="#242833",
+                    font=dict(color="white"),
+                    xaxis_title="Time to maturity (années)",
+                    yaxis_title=f"{greek_choice_b76} agrégé"
+                )
+                st.plotly_chart(fig_T_b76, use_container_width=True)
+
+                # Rappel sous le graphique
+                st.caption("Greek sélectionné : " + greek_choice_b76)
+            else:
+                st.info("La colonne 'Maturity' n'est pas présente dans st.session_state.positions.")
+        else:
+            st.info("Aucune donnée B76 / positions pour ce graphique.")
+
     st.markdown("---")
 
     st.markdown("### Bachelier Model")
@@ -1677,6 +1951,114 @@ if selected_tab == "Greeks":
             st.metric("Vega Total", f"{total_vega_bach:.4f}")
     else:
         st.info("Aucune donnee Bachelier. Cliquez sur 'Actualiser avec Bloomberg' pour calculer.")
+
+    st.markdown("### Vue agrégée des Greeks (Bachelier)")
+
+    col_left_bach, col_right_bach = st.columns(2)
+
+    # Colonne gauche : par produit
+    with col_left_bach:
+        st.markdown("#### Greeks par produit (Bachelier)")
+
+        if not st.session_state.bachelier_greeks.empty:
+            df_bach = st.session_state.bachelier_greeks.copy()
+            df_bach["Delta_w"] = df_bach["Delta"] * df_bach["Position_Size"]
+            df_bach["Gamma_w"] = df_bach["Gamma"] * df_bach["Position_Size"]
+            df_bach["Vega_w"] = df_bach["Vega"] * df_bach["Position_Size"]
+
+            agg_bach = (
+                df_bach
+                .groupby("Product")[["Delta_w", "Gamma_w", "Vega_w"]]
+                .sum()
+                .reset_index()
+            )
+
+            fig_bach_bar = px.bar(
+                agg_bach,
+                x="Product",
+                y=["Delta_w", "Gamma_w", "Vega_w"],
+                barmode="group",
+                title="Greeks agrégés par produit (Bachelier)"
+            )
+            fig_bach_bar.update_layout(
+                plot_bgcolor="#242833",
+                paper_bgcolor="#242833",
+                font=dict(color="white"),
+                xaxis_title="Produit",
+                yaxis_title="Valeur agrégée",
+                legend_title="Greek"
+            )
+            st.plotly_chart(fig_bach_bar, use_container_width=True)
+        else:
+            st.info("Aucun Greek Bachelier disponible pour le graphique.")
+
+    # Colonne droite : par maturité
+    with col_right_bach:
+        st.markdown("#### Greeks agrégés par maturité (Bachelier)")
+
+        if not st.session_state.bachelier_greeks.empty and not st.session_state.positions.empty:
+            df_bach = st.session_state.bachelier_greeks.copy()
+            df_pos = st.session_state.positions.copy()
+
+            from datetime import date
+
+            valuation_date = date.today()
+
+
+            def _compute_T(row):
+                try:
+                    return safe_time_to_maturity(row["Maturity"], valuation_date)
+                except Exception:
+                    return None
+
+
+            if "Maturity" in df_pos.columns:
+                df_pos["T_years"] = df_pos.apply(_compute_T, axis=1)
+
+                df_pos_t = df_pos[["Ticker", "T_years"]].rename(
+                    columns={"Ticker": "Product"}
+                )
+                df_bach = df_bach.merge(df_pos_t, on="Product", how="left")
+
+                greek_choice_bach = st.selectbox(
+                    "Greek à afficher par maturité (Bachelier)",
+                    ["Delta", "Gamma", "Vega"],
+                    index=2,
+                    key="bach_greek_by_T"
+                )
+
+                df_bach["Greek_w"] = df_bach[greek_choice_bach] * df_bach["Position_Size"]
+                df_bach["T_bucket"] = df_bach["T_years"].round(2)
+
+                agg_T_bach = (
+                    df_bach
+                    .dropna(subset=["T_bucket"])
+                    .groupby("T_bucket")["Greek_w"]
+                    .sum()
+                    .reset_index()
+                    .sort_values("T_bucket")
+                )
+
+                fig_T_bach = px.bar(
+                    agg_T_bach,
+                    x="T_bucket",
+                    y="Greek_w",
+                    title=f"{greek_choice_bach} agrégé par maturité (Bachelier)"
+                )
+                fig_T_bach.update_layout(
+                    plot_bgcolor="#242833",
+                    paper_bgcolor="#242833",
+                    font=dict(color="white"),
+                    xaxis_title="Time to maturity (années)",
+                    yaxis_title=f"{greek_choice_bach} agrégé"
+                )
+                st.plotly_chart(fig_T_bach, use_container_width=True)
+
+                st.caption("Greek sélectionné : " + greek_choice_bach)
+            else:
+                st.info("La colonne 'Maturity' n'est pas présente dans st.session_state.positions.")
+        else:
+            st.info("Aucune donnée Bachelier / positions pour ce graphique.")
 
     st.markdown("---")
 
@@ -1732,33 +2114,165 @@ if selected_tab == "Greeks":
 if selected_tab == "Courbe des Taux":
     st.subheader("Courbe des Taux US Treasury")
 
-    if st.session_state.rates_data is not None:
+    if st.session_state.rates_data is not None and not st.session_state.rates_data.empty:
         rates_df = st.session_state.rates_data
 
-        if 'Tenor' in rates_df.columns and 'Rate_%' in rates_df.columns:
+        # Vérifier que les colonnes nécessaires existent
+        if 'Maturity_Years' in rates_df.columns and 'Rate_%' in rates_df.columns:
+
+            # Calculer le minimum pour l'axe Y
+            min_rate = rates_df['Rate_%'].min()
+            y_axis_min = min_rate - 0.20
+
+            # Créer le graphique Plotly (style Bloomberg)
             fig_rates = go.Figure()
 
+            # Ajouter la courbe avec ligne lissée
             fig_rates.add_trace(go.Scatter(
-                x=rates_df['Tenor'],
+                x=rates_df['Maturity_Years'],
                 y=rates_df['Rate_%'],
                 mode='lines+markers',
-                name='Yield Curve',
-                line=dict(color='blue', width=3),
-                marker=dict(size=8)
+                name='US Treasury Yield',
+                line=dict(
+                    color='#FF4136',
+                    width=3,
+                    shape='spline'
+                ),
+                marker=dict(
+                    size=8,
+                    color='#FF4136',
+                    symbol='circle'
+                ),
+                hovertemplate='<b>%{customdata[0]}</b><br>' +
+                              '<b>Maturity:</b> %{x:.1f} years<br>' +
+                              '<b>Yield:</b> %{y:.3f}%<br>' +
+                              '<extra></extra>',
+                customdata=rates_df[['Tenor']].values
             ))
 
             fig_rates.update_layout(
-                title='US Treasury Yield Curve',
-                xaxis_title='Maturity (Years)',
-                yaxis_title='Yield (%)',
+                title={
+                    'text': 'US Treasury Yield Curve - Last Mid YTM',
+                    'font': {'size': 18, 'color': '#FFFFFF'}
+                },
+                xaxis=dict(
+                    title=dict(
+                        text='Maturity (Years)',
+                        font=dict(size=16, color="white", family="Arial")
+                    ),
+                    showgrid=True,
+                    gridcolor='rgba(255, 255, 255, 0.15)',
+                    gridwidth=1,
+                    zeroline=True,
+                    zerolinecolor='rgba(255, 255, 255, 0.3)',
+                    zerolinewidth=2,
+                    tickfont=dict(size=12, color="white"),
+                    range=[0, 30],
+                    dtick=5,
+                    tickformat='.1f'
+                ),
+                yaxis=dict(
+                    title=dict(
+                        text='Yield (%)',
+                        font=dict(size=16, color="white", family="Arial")
+                    ),
+                    showgrid=True,
+                    gridcolor='rgba(255, 255, 255, 0.15)',
+                    gridwidth=1,
+                    zeroline=True,
+                    zerolinecolor='rgba(255, 255, 255, 0.3)',
+                    zerolinewidth=2,
+                    tickfont=dict(size=12, color="white"),
+                    range=[y_axis_min, rates_df['Rate_%'].max() + 0.2],
+                    tickformat='.3f'
+                ),
                 hovermode='x unified',
-                height=500
+                plot_bgcolor='#242833',
+                paper_bgcolor='#242833',
+                height=600,
+                showlegend=False,
+                margin=dict(l=80, r=40, t=80, b=60)
             )
 
             st.plotly_chart(fig_rates, use_container_width=True)
-            st.dataframe(rates_df, use_container_width=True)
+
+            # Métriques clés
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                try:
+                    rate_3m = rates_df[rates_df['Tenor'] == '3M']['Rate_%'].values[0]
+                    st.metric("3 Mois", f"{rate_3m:.3f}%")
+                except:
+                    st.metric("3 Mois", "N/A")
+
+            with col2:
+                try:
+                    rate_2y = rates_df[rates_df['Tenor'] == '2Y']['Rate_%'].values[0]
+                    st.metric("2 Ans", f"{rate_2y:.3f}%")
+                except:
+                    st.metric("2 Ans", "N/A")
+
+            with col3:
+                try:
+                    rate_10y = rates_df[rates_df['Tenor'] == '10Y']['Rate_%'].values[0]
+                    st.metric("10 Ans", f"{rate_10y:.3f}%")
+                except:
+                    st.metric("10 Ans", "N/A")
+
+            with col4:
+                try:
+                    rate_30y = rates_df[rates_df['Tenor'] == '30Y']['Rate_%'].values[0]
+                    st.metric("30 Ans", f"{rate_30y:.3f}%")
+                except:
+                    st.metric("30 Ans", "N/A")
+
+            st.markdown("---")
+
+            # Tableau des données
+            st.markdown("###  Données détaillées")
+
+            st.dataframe(
+                rates_df,
+                use_container_width=True,
+                column_config={
+                    "Tenor": st.column_config.TextColumn("Tenor", width="small"),
+                    "Maturity_Years": st.column_config.NumberColumn(
+                        "Maturity (Years)",
+                        format="%.2f"
+                    ),
+                    "Ticker": st.column_config.TextColumn("Bloomberg Ticker"),
+                    "Rate_%": st.column_config.NumberColumn(
+                        "Yield (%)",
+                        format="%.3f"
+                    ),
+                    "Rate_Decimal": st.column_config.NumberColumn(
+                        "Yield (Decimal)",
+                        format="%.5f"
+                    )
+                },
+                hide_index=True
+            )
+
+        else:
+            st.error("❌ Les colonnes nécessaires sont manquantes")
+
     else:
-        st.info("Aucune donnee de courbe des taux. Importez un fichier Excel contenant l'onglet 'US_Rates_Curve'.")
+        st.info(" Aucune courbe des taux disponible.")
+        st.markdown("""
+        **Pour récupérer la courbe des taux US Treasury:**
+
+        1. Assurez-vous que Bloomberg Terminal est actif
+        2. Cliquez sur **"Calculer les risques"** dans la sidebar
+        3. La courbe sera automatiquement récupérée depuis Bloomberg
+
+        **Tickers Bloomberg utilisés:**
+        - 3M: USGG3M Index
+        - 2Y: USGG2YR Index
+        - 10Y: USGG10YR Index
+        - 30Y: USGG30YR Index
+        - ... et 7 autres tenors
+        """)
 
 if selected_tab == "Analyse":
     st.subheader("Analyse de Risque")
