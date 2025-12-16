@@ -8,7 +8,7 @@
 
 ## Overview
 
-This project is a **real-time risk monitoring application for commodity options trading**, built with **Python** and **Streamlit**, and deeply integrated with **Bloomberg**.
+This project is a **real-time risk monitoring application for commodity options trading**, built with **Python** and **Streamlit**, and live integration to **Bloomberg**.
 
 The core idea is simple:
 
@@ -31,7 +31,6 @@ The repository includes a short video demonstrating the application in action:
 * The video walks through:
 
   * Loading the Excel trade blotter
-  * Connecting to Bloomberg
   * Visualizing real-time Greeks and risk
   * Exploring volatility smiles and model outputs
   * Exporting and emailing risk reports
@@ -40,7 +39,7 @@ The repository includes a short video demonstrating the application in action:
 
 ## Trade Input: Standardized Excel Blotter
 
-All trades are assumed to be recorded in a **standardized Excel file** containing:
+All trades are assumed to be recorded in a **standardized Excel file** ("Commodities_Deals.xlsx")containing:
 
 * Option tickers
 * Contract Size
@@ -49,8 +48,6 @@ All trades are assumed to be recorded in a **standardized Excel file** containin
 * Maturities
 * Trade prices
 * Option type (Call / Put)
-
-This Excel file acts as the **single source of truth** for executed deals.
 
 The application allows you to:
 
