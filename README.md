@@ -26,7 +26,7 @@ The repository includes a short video demonstrating the application in action:
 
 [![Demo Video](https://img.shields.io/badge/Demo-Video-blueviolet)](Tutorial%20Risk%20Monitor%20App.mp4)
 
-[![Risk Monitor Demo](assets/demo_thumbnail.png)](Tutorial%20Risk%20Monitor%20App.mp4)
+[![Risk Monitor Demo](Tutorial%20Risk%20Monitor%20App.mp4)
 
 
 * **File**: `Tutorial Risk Monitor App.mp4`
