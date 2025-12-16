@@ -36,8 +36,6 @@ The repository includes a short video demonstrating the application in action:
   * Exploring volatility smiles and model outputs
   * Exporting and emailing risk reports
 
-You can watch the video directly from the repository to quickly understand how the app works end-to-end.
-
 ---
 
 ## Trade Input: Standardized Excel Blotter
