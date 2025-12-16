@@ -10,11 +10,11 @@
 
 This project is a **real-time risk monitoring application for commodity options trading**, built with **Python** and **Streamlit**, and deeply integrated with **Bloomberg**.
 
-The core idea is simple but powerful:
+The core idea is simple:
 
 > **Standardize the way executed trades are stored (via an Excel file), and transform that static trade blotter into a dynamic, real-time risk monitor using Bloomberg market data and multiple pricing models.**
 
-The application is designed for traders or risk managers who actively trade **options on commodities** (e.g. energy, metals, etc.) and want:
+The application gives:
 
 * A clear, consolidated view of Greeks and PnL
 * Model comparison beyond Bloomberg’s built-in analytics
@@ -42,6 +42,7 @@ You can watch the video directly from the repository to quickly understand how t
 All trades are assumed to be recorded in a **standardized Excel file** containing:
 
 * Option tickers
+* Contract Size
 * Position sizes (long / short)
 * Strikes
 * Maturities
@@ -60,7 +61,7 @@ This approach ensures consistency, reproducibility, and easy integration with ex
 
 ---
 
-## Bloomberg Integration (Critical Requirement)
+## Bloomberg Integration (Requirement)
 
 ⚠️ **A running Bloomberg Terminal is required**
 
@@ -78,7 +79,9 @@ Bloomberg is used to fetch:
 * Underlying futures prices
 * US Treasury yields (govies) for rate curve construction
 
-If Bloomberg is not available, the app **gracefully falls back** to internal pricing models for risk calculations.
+The Python API can be installed through ‘pip’ using:
+
+>> python -m pip install --index-url=https://blpapi.bloomberg.com/repository/releases/python/simple/ blpapi
 
 ---
 
@@ -204,7 +207,7 @@ You can:
 * Export to **CSV** for downstream systems
 * Send the Excel report **by email** directly from the app
 
-📧 **Email note**:
+ **Email note**:
 
 * Emails are sent via **SendGrid**
 * Attachments are included
@@ -221,19 +224,6 @@ You can:
 * **SciPy** – numerical methods
 * **Plotly** – interactive charts
 * **SendGrid** – email delivery
-
----
-
-## Target Users
-
-This project is designed for:
-
-* Commodity option traders
-* Trading desks
-* Risk managers
-* Quantitative analysts
-
-who want a **transparent, model-driven, and extensible risk monitoring tool** that complements Bloomberg rather than replacing it.
 
 ---
 
