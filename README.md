@@ -10,7 +10,7 @@
 
 This project is a **real-time risk monitoring application for commodity options trading**, built with **Python** and **Streamlit**, and live integration to **Bloomberg**.
 
-The core idea is simple:
+The core idea is to:
 
 > **Standardize the way executed trades are stored (via an Excel file), and transform that static trade blotter into a dynamic, real-time risk monitor using Bloomberg market data and multiple pricing models.**
 
